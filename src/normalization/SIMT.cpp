@@ -138,13 +138,75 @@ namespace
     using DivergencePredicate = std::function<bool(const Value& condition)>;
 } // namespace
 
-static bool isSupportedType(const DataType& type)
+/*
+ * Scalars of at most 32 bits, and in vector kernels (see determineVectorWidth) vectors of the kernel's vector width with
+ * 32-bit elements.
+ */
+static bool isSupportedType(const DataType& type, uint8_t vectorWidth)
 {
     if(type.getPointerType())
         return true;
     if(type.isLabelType() || type.isVoidType())
         return true;
-    return type.isScalarType() && type.getScalarBitCount() <= 32;
+    if(type.isScalarType())
+        return type.getScalarBitCount() <= 32;
+    return vectorWidth > 1 && type.getVectorWidth() == vectorWidth && type.getScalarBitCount() == 32;
+}
+
+/*
+ * The vector width of the kernel: 1 if it uses no vector types, the single vector width N (2, 4 or 8) of all its
+ * vectors otherwise. Such a kernel runs with 16 / N work-items per QPU, each in N adjacent SIMD lanes: lane
+ * (work-item * N + element). Returns 0 if the vector types are not supported.
+ *
+ * Kernels using only 16-element vectors already use all SIMD lanes, so they don't run in SIMT mode.
+ */
+static uint8_t determineVectorWidth(const Method& method, std::string& reason)
+{
+    std::set<unsigned> widths;
+    const IntermediateInstruction* currentInstruction = nullptr;
+    auto addType = [&](const DataType& type) {
+        auto ptrType = type.getPointerType();
+        const auto& valueType = ptrType ? ptrType->elementType : type;
+        if(!valueType.isLabelType() && valueType.isVectorType() && widths.emplace(valueType.getVectorWidth()).second)
+            reason += " " + valueType.to_string() + " (" +
+                (currentInstruction ? currentInstruction->to_string() : std::string("parameter")) + ")";
+    };
+    for(const auto& param : method.parameters)
+        addType(param.type);
+    for(const auto& block : method)
+    {
+        for(const auto& instr : block)
+        {
+            if(!instr)
+                continue;
+            currentInstruction = instr.get();
+            instr->forUsedLocals(
+                [&](const Local* loc, LocalUse::Type, const IntermediateInstruction&) { addType(loc->type); });
+            for(const auto& arg : instr->getArguments())
+                addType(arg.type);
+        }
+    }
+    // the element number register is a 16-element vector, but no vector of the kernel. Kernels using only 16-element
+    // vectors don't run in SIMT mode either, see isSupportedType.
+    widths.erase(NATIVE_VECTOR_SIZE);
+    if(widths.empty())
+        return 1;
+    if(widths.size() == 1 && (*widths.begin() == 2 || *widths.begin() == 4 || *widths.begin() == 8))
+        return static_cast<uint8_t>(*widths.begin());
+    return 0;
+}
+
+static bool isWorkItemFunction(const MethodCall& call)
+{
+    for(const auto& name : {intrinsics::FUNCTION_NAME_LOCAL_SIZE, intrinsics::FUNCTION_NAME_LOCAL_ID,
+            intrinsics::FUNCTION_NAME_NUM_DIMENSIONS, intrinsics::FUNCTION_NAME_NUM_GROUPS,
+            intrinsics::FUNCTION_NAME_GROUP_ID, intrinsics::FUNCTION_NAME_GLOBAL_OFFSET,
+            intrinsics::FUNCTION_NAME_GLOBAL_SIZE, intrinsics::FUNCTION_NAME_GLOBAL_ID})
+    {
+        if(call.methodName == name)
+            return true;
+    }
+    return false;
 }
 
 static bool isWorkItemIdCall(const MethodCall& call)
@@ -176,7 +238,7 @@ static Optional<int32_t> getDimension(const MethodCall& call)
  * Rejects kernels using functionality which is not (yet) supported in SIMT mode. Returns the reason, or an empty
  * string if the kernel might be supported.
  */
-static std::string checkUnsupported(const Method& method)
+static std::string checkUnsupported(const Method& method, uint8_t vectorWidth)
 {
     const auto& sizes = method.metaData.workGroupSizes;
     if(sizes[0] != 0 && (sizes[0] > NUM_QPUS * SIMT_WIDTH || sizes[1] > 1 || sizes[2] > 1))
@@ -185,7 +247,7 @@ static std::string checkUnsupported(const Method& method)
         return "uses private memory (stack allocations)";
     for(const auto& param : method.parameters)
     {
-        if(!isSupportedType(param.type))
+        if(!isSupportedType(param.type, vectorWidth) || (vectorWidth > 1 && param.type.isVectorType()))
             return "parameter type " + param.type.to_string();
         if(auto ptrType = param.type.getPointerType())
         {
@@ -213,6 +275,21 @@ static std::string checkUnsupported(const Method& method)
                 }
                 if(isWorkItemIdCall(*call) && !getDimension(*call))
                     return "work-item ID with non-constant dimension";
+                // the functions are intrinsified after this pass and wouldn't know about the vector layout
+                if(vectorWidth > 1 && !isWorkItemFunction(*call))
+                    return "calls " + call->methodName + " in a vector kernel";
+            }
+            if(vectorWidth > 1)
+            {
+                // vector constants other than splats would need to be repeated for every work-item
+                auto load = dynamic_cast<const LoadImmediate*>(instr.get());
+                if(load && load->type != LoadType::REPLICATE_INT32)
+                    return "vector constant in a vector kernel: " + instr->to_string();
+                for(const auto& arg : instr->getArguments())
+                {
+                    if(arg.type.isVectorType() && !arg.checkLocal() && !arg.checkRegister() && !arg.isAllSame())
+                        return "vector constant in a vector kernel: " + instr->to_string();
+                }
             }
             if(auto mem = dynamic_cast<const MemoryInstruction*>(instr.get()))
             {
@@ -224,7 +301,7 @@ static std::string checkUnsupported(const Method& method)
             }
             bool unsupportedType = false;
             instr->forUsedLocals([&](const Local* loc, LocalUse::Type, const IntermediateInstruction&) {
-                if(!isSupportedType(loc->type))
+                if(!isSupportedType(loc->type, vectorWidth))
                     unsupportedType = true;
             });
             if(unsupportedType)
@@ -610,6 +687,22 @@ static bool isMemoryWrite(const IntermediateInstruction& instr)
     return mem && mem->op == MemoryOperation::WRITE;
 }
 
+static bool writesReplicationRegister(const IntermediateInstruction& instr)
+{
+    auto out = instr.getOutput();
+    return out && (out->hasRegister(REG_REPLICATE_ALL) || out->hasRegister(REG_REPLICATE_QUAD));
+}
+
+static bool readsReplicationRegister(const IntermediateInstruction& instr)
+{
+    for(const auto& arg : instr.getArguments())
+    {
+        if(arg.hasRegister(REG_REPLICATE_ALL) || arg.hasRegister(REG_REPLICATE_QUAD) || arg.hasRegister(REG_ACC5))
+            return true;
+    }
+    return false;
+}
+
 static void markVarying(Analysis& analysis, const Local* loc, LaneInfo info, bool& changed)
 {
     auto it = analysis.varying.find(loc);
@@ -714,6 +807,8 @@ static Analysis analyzeVaryingValues(Method& method, const ControlFlow& cf)
         {
             // whether the flags were last set from a varying value
             bool varyingFlags = false;
+            // whether the replication register (r5) was last written with a varying value, e.g. for a splat
+            bool varyingReplication = false;
             for(auto& instr : block)
             {
                 if(!instr)
@@ -736,6 +831,10 @@ static Analysis analyzeVaryingValues(Method& method, const ControlFlow& cf)
                     if(analysis.varying.find(loc) != analysis.varying.end())
                         readsVarying = true;
                 });
+                if(varyingReplication && readsReplicationRegister(*instr))
+                    readsVarying = true;
+                if(writesReplicationRegister(*instr))
+                    varyingReplication = readsVarying;
                 auto mem = dynamic_cast<const MemoryInstruction*>(instr.get());
                 if(mem && mem->op == MemoryOperation::READ)
                 {
@@ -780,9 +879,35 @@ static Analysis analyzeVaryingValues(Method& method, const ControlFlow& cf)
  * Checks whether the kernel can be run in SIMT mode with the given varying values. Returns the reason why not, or an
  * empty string.
  */
-static std::string checkVaryingValues(
-    const Method& method, const Analysis& analysis, const ControlFlow& cf, const std::vector<Region>& regions)
+/*
+ * In vector kernels, rotations are only supported where the front-end uses them to access single vector elements: they
+ * are only used by replications (splats), element insertions and the extraction of the first element. Then the lanes
+ * read from the rotated value never cross the boundary between work-items (see convertVectorOperations).
+ */
+static bool isElementAccessRotation(const MoveOperation& rotation)
 {
+    auto out = rotation.checkOutputLocal();
+    if(!out)
+        return false;
+    bool supported = true;
+    out->forUsers(LocalUse::Type::READER, [&](const LocalUser* user) {
+        auto move = dynamic_cast<const MoveOperation*>(user);
+        if(!move || move->getVectorRotation())
+            supported = false;
+        else if(move->hasConditionalExecution() || move->getOutput()->hasRegister(REG_REPLICATE_ALL))
+            // element insertion or replication
+            return;
+        else if(!move->getOutput()->type.isScalarType())
+            supported = false;
+    });
+    return supported;
+}
+
+static std::string checkVaryingValues(const Method& method, const Analysis& analysis, const ControlFlow& cf,
+    const std::vector<Region>& regions, uint8_t vectorWidth)
+{
+    if(vectorWidth > 1 && !regions.empty())
+        return "divergent control flow in a vector kernel";
     // the blocks of the divergent regions (including the branch blocks), and the region blocks only
     FastSet<const BasicBlock*> divergentBlocks;
     FastSet<const BasicBlock*> maskedBlocks;
@@ -821,9 +946,15 @@ static std::string checkVaryingValues(
                     mem->op == MemoryOperation::READ ? mem->getSourceElementType() : mem->getDestinationElementType();
                 if(analysis.isVarying(address))
                 {
+                    // the work-items access consecutive elements (scalars or vectors). In vector kernels, the work-items
+                    // may also read one element of consecutive vectors (a vector load split up by the front-end).
                     auto stride = analysis.getStride(address);
-                    if(!stride || !elementType.isScalarType() ||
-                        *stride != static_cast<int64_t>(elementType.getScalarBitCount() / 8))
+                    auto elementBytes =
+                        static_cast<int64_t>(elementType.getScalarBitCount() / 8 * elementType.getVectorWidth());
+                    bool isVectorElementRead = vectorWidth > 1 && mem->op == MemoryOperation::READ &&
+                        elementType.isScalarType() && stride && *stride == elementBytes * vectorWidth;
+                    if(!stride || (*stride != elementBytes && !isVectorElementRead) ||
+                        !isSupportedType(elementType, vectorWidth))
                         return "memory access which is not contiguous across work-items: " + mem->to_string();
                     if(mem->op == MemoryOperation::WRITE && maskedBlocks.find(&block) != maskedBlocks.end() &&
                         elementType.getScalarBitCount() != 32)
@@ -832,6 +963,9 @@ static std::string checkVaryingValues(
                 }
                 else if(mem->op == MemoryOperation::WRITE && analysis.isVarying(mem->getSource()))
                     return "work-items writing different values to the same address: " + mem->to_string();
+                else if(mem->op == MemoryOperation::WRITE && vectorWidth > 1 && elementType.isVectorType())
+                    // the store would be taken for a store of the work-items' elements, see lowerWriteRAM
+                    return "vector store to a work-group uniform address: " + mem->to_string();
             }
             if(readsVarying && !dynamic_cast<const Operation*>(instr.get()) &&
                 !dynamic_cast<const MoveOperation*>(instr.get()) &&
@@ -841,7 +975,10 @@ static std::string checkVaryingValues(
                 return "unsupported instruction reading a work-item dependent value: " + instr->to_string();
             if(auto move = dynamic_cast<const MoveOperation*>(instr.get()))
             {
-                if(readsVarying && move->getVectorRotation())
+                bool isVectorAccess = vectorWidth > 1 && (move->getSource().type.isVectorType() || readsVarying);
+                if(move->getVectorRotation() && isVectorAccess && !isElementAccessRotation(*move))
+                    return "unsupported vector shuffle: " + move->to_string();
+                if(readsVarying && move->getVectorRotation() && vectorWidth == 1)
                     return "vector rotation of a work-item dependent value: " + move->to_string();
             }
 
@@ -853,19 +990,127 @@ static std::string checkVaryingValues(
 }
 
 /*
+ * Vector kernels (see determineVectorWidth): every work-item uses vectorWidth adjacent SIMD lanes.
+ */
+
+static Value rotate(Method& method, InstructionWalker& it, const Value& src, uint32_t offset, Direction direction)
+{
+    // copy into a 16-element value first, so the rotation is not shortened to the source's vector width
+    auto source = assign(it, src.type.toVectorType(SIMT_WIDTH), "%simt_rotation_source") = src;
+    auto result = method.addNewLocal(src.type.toVectorType(SIMT_WIDTH), "%simt_rotated");
+    it = insertVectorRotation(it, source, Value(Literal(offset), TYPE_INT8), result, direction);
+    return result;
+}
+
+/*
+ * dest[lane] = src[first lane of the work-item]: replicates the first element of every work-item to all of its lanes
+ * (the vector kernel's version of replicating element 0 to all lanes).
+ */
+static void insertWorkItemReplication(Method& method, InstructionWalker& it, const Value& src, const Value& dest,
+    uint8_t vectorWidth, const Value& elementIndex)
+{
+    assign(it, dest) = src;
+    for(uint32_t offset = 1; offset < vectorWidth; ++offset)
+    {
+        auto rotated = rotate(method, it, src, offset, Direction::UP);
+        assign(it, NOP_REGISTER) = (elementIndex ^ Value(Literal(offset), TYPE_INT8), SetFlag::SET_FLAGS);
+        assign(it, dest) = (rotated, COND_ZERO_SET);
+    }
+}
+
+/*
+ * dest[lane] = src[lane / vectorWidth]: distributes the values of consecutive elements to the work-items, e.g. the
+ * values of a scalar load of 16 consecutive elements (of which the first 16 / vectorWidth belong to the work-items).
+ */
+static void insertExpansion(Method& method, InstructionWalker& it, const Value& src, const Value& dest,
+    uint8_t vectorWidth, const Value& elementIndex)
+{
+    auto spread = assign(it, src.type.toVectorType(SIMT_WIDTH), "%simt_spread") = src;
+    // first move the value of work-item w into its first lane w * vectorWidth
+    for(uint32_t w = 1; w < SIMT_WIDTH / vectorWidth; ++w)
+    {
+        auto rotated = rotate(method, it, src, w * (vectorWidth - 1u), Direction::UP);
+        assign(it, NOP_REGISTER) =
+            (ELEMENT_NUMBER_REGISTER ^ Value(Literal(w * vectorWidth), TYPE_INT8), SetFlag::SET_FLAGS);
+        assign(it, spread) = (rotated, COND_ZERO_SET);
+    }
+    insertWorkItemReplication(method, it, spread, dest, vectorWidth, elementIndex);
+}
+
+/*
+ * dest[w] = src[w * vectorWidth]: collects the (scalar) values of the work-items into consecutive elements, e.g. for a
+ * scalar store to consecutive addresses.
+ */
+static void insertCompaction(Method& method, InstructionWalker& it, const Value& src, const Value& dest,
+    uint8_t vectorWidth)
+{
+    assign(it, dest) = src;
+    for(uint32_t w = 1; w < SIMT_WIDTH / vectorWidth; ++w)
+    {
+        auto rotated = rotate(method, it, src, w * (vectorWidth - 1u), Direction::DOWN);
+        assign(it, NOP_REGISTER) = (ELEMENT_NUMBER_REGISTER ^ Value(Literal(w), TYPE_INT8), SetFlag::SET_FLAGS);
+        assign(it, dest) = (rotated, COND_ZERO_SET);
+    }
+}
+
+/*
  * Converts the method: varying values become vectors with one element per work-item.
  */
-static void convertToSIMT(Method& method, const Analysis& analysis)
+static void convertToSIMT(Method& method, const Analysis& analysis, uint8_t vectorWidth)
 {
-    // 1. new vector locals for all varying non-pointer values. Pointers keep their type: they hold the per-lane
-    // address, but only the address in lane 0 is used by the (converted) memory accesses below.
+    const auto workItemsPerQPU = static_cast<uint8_t>(SIMT_WIDTH / vectorWidth);
+    auto startIt = method.walkAllInstructions();
+    if(!startIt.isEndOfMethod() && startIt.get<BranchLabel>())
+        startIt.nextInBlock();
+
+    // 1. new 16-element locals for all varying non-pointer values (in vector kernels, a scalar value is repeated in
+    // all lanes of its work-item) and in vector kernels for all vectors. Pointers keep their type: they hold the
+    // per-lane address, but only the address in lane 0 is used by the (converted) memory accesses below.
     FastMap<const Local*, Value> replacements;
-    for(const auto& entry : analysis.varying)
-    {
-        const Local* loc = entry.first;
-        if(loc->type.getPointerType())
-            continue;
+    FastSet<const Local*> vectorLocals;
+    auto addReplacement = [&](const Local* loc) {
+        if(loc->type.getPointerType() || loc->type.isLabelType() || replacements.find(loc) != replacements.end())
+            return;
         replacements.emplace(loc, method.addNewLocal(loc->type.toVectorType(SIMT_WIDTH), loc->name, "simt"));
+    };
+    for(const auto& entry : analysis.varying)
+        addReplacement(entry.first);
+
+    // vector kernels: lane = work-item * vectorWidth + element
+    Value elementIndex = ELEMENT_NUMBER_REGISTER;
+    Value workItemIndex = ELEMENT_NUMBER_REGISTER;
+    if(vectorWidth > 1)
+    {
+        elementIndex = method.addNewLocal(ELEMENT_NUMBER_REGISTER.type, "%simt_element_index");
+        workItemIndex = method.addNewLocal(ELEMENT_NUMBER_REGISTER.type, "%simt_work_item_index");
+        for(auto& block : method)
+        {
+            for(auto& instr : block)
+            {
+                if(!instr)
+                    continue;
+                instr->forUsedLocals([&](const Local* loc, LocalUse::Type, const IntermediateInstruction&) {
+                    if(!loc->type.getPointerType() && !loc->type.isLabelType() && loc->type.isVectorType())
+                    {
+                        vectorLocals.emplace(loc);
+                        addReplacement(loc);
+                    }
+                });
+                // the front-end uses the element number for element accesses, which refer to the element of the
+                // work-item's vector
+                const auto args = instr->getArguments();
+                for(std::size_t i = 0; i < args.size(); ++i)
+                {
+                    if(args[i].hasRegister(REG_ELEMENT_NUMBER))
+                        instr->setArgument(i, elementIndex);
+                }
+            }
+        }
+        // inserted after the loop above, so the element number read here is not replaced
+        uint32_t shift = vectorWidth == 2 ? 1 : (vectorWidth == 4 ? 2 : 3);
+        assign(startIt, elementIndex) =
+            (ELEMENT_NUMBER_REGISTER & Value(Literal(vectorWidth - 1u), TYPE_INT8));
+        assign(startIt, workItemIndex) = as_unsigned{ELEMENT_NUMBER_REGISTER} >> Value(Literal(shift), TYPE_INT8);
     }
 
     for(auto& block : method)
@@ -881,7 +1126,7 @@ static void convertToSIMT(Method& method, const Analysis& analysis)
             }
 
             // 2. work-item IDs in dimension 0: the ID of the QPU's first work-item (as calculated today, since the
-            // run-time passes the first local ID of every QPU) plus the element number
+            // run-time passes the first local ID of every QPU) plus the index of the lane's work-item
             auto call = it.get<MethodCall>();
             if(call && isWorkItemIdCall(*call))
             {
@@ -893,7 +1138,7 @@ static void convertToSIMT(Method& method, const Analysis& analysis)
                     call->setOutput(base);
                     auto next = it.copy().nextInBlock();
                     next.emplace(std::make_unique<Operation>(
-                        OP_ADD, Value(replacement->second), Value(base), Value(ELEMENT_NUMBER_REGISTER)));
+                        OP_ADD, Value(replacement->second), Value(base), Value(workItemIndex)));
                     CPPLOG_LAZY(logging::Level::DEBUG,
                         log << "SIMT: work-item ID per lane: " << next->to_string() << logging::endl);
                     it.nextInBlock().nextInBlock();
@@ -901,37 +1146,124 @@ static void convertToSIMT(Method& method, const Analysis& analysis)
                 }
             }
 
-            // 3. memory accesses with per-lane contiguous addresses: access a vector of 16 elements at the address of
-            // lane 0
+            // 3. memory accesses with per-work-item contiguous addresses: access 16 elements at the address of lane 0
             if(auto mem = it.get<MemoryInstruction>())
             {
                 bool isRead = mem->op == MemoryOperation::READ;
                 const Value address = isRead ? mem->getSource() : mem->getDestination();
+                auto elementType = isRead ? mem->getSourceElementType() : mem->getDestinationElementType();
+                auto ptrType = address.type.getPointerType();
                 if(analysis.isVarying(address))
                 {
-                    auto ptrType = address.type.getPointerType();
-                    auto elementType = isRead ? mem->getSourceElementType() : mem->getDestinationElementType();
+                    // scalars in vector kernels: the work-items' elements are in the first lanes in memory
+                    bool isScalarOfVectorKernel = vectorWidth > 1 && elementType.isScalarType();
+                    auto accessType = elementType.toVectorType(
+                        isScalarOfVectorKernel && !isRead ? workItemsPerQPU : static_cast<uint8_t>(SIMT_WIDTH));
                     auto vectorPtr = method.addNewLocal(
-                        method.createPointerType(
-                            elementType.toVectorType(SIMT_WIDTH), ptrType->addressSpace, ptrType->alignment),
+                        method.createPointerType(accessType, ptrType->addressSpace, ptrType->alignment),
                         address.checkLocal()->name, "simt_ptr");
                     it.emplace(std::make_unique<MoveOperation>(vectorPtr, address));
                     it.nextInBlock();
                     mem = it.get<MemoryInstruction>();
                     // the address is the source of a read and the output of a write
                     if(isRead)
+                    {
                         mem->setArgument(0, vectorPtr);
+                        if(isScalarOfVectorKernel)
+                        {
+                            const Value dest = mem->getDestination();
+                            auto loaded = method.addNewLocal(accessType, "%simt_loaded");
+                            mem->setOutput(loaded);
+                            it.nextInBlock();
+                            auto stride = analysis.getStride(address);
+                            if(stride && *stride == static_cast<int64_t>(elementType.getScalarBitCount() / 8))
+                                // consecutive scalars: the value of work-item w is in lane w
+                                insertExpansion(method, it, loaded, dest, vectorWidth, elementIndex);
+                            else
+                                // the same element of consecutive vectors: the value of work-item w is in its first
+                                // lane w * vectorWidth already
+                                insertWorkItemReplication(method, it, loaded, dest, vectorWidth, elementIndex);
+                            continue;
+                        }
+                    }
                     else
+                    {
                         mem->setOutput(vectorPtr);
+                        if(isScalarOfVectorKernel)
+                        {
+                            auto compacted = method.addNewLocal(accessType, "%simt_compacted");
+                            insertCompaction(method, it, mem->getSource(), compacted, vectorWidth);
+                            mem->setArgument(0, compacted);
+                        }
+                    }
                     CPPLOG_LAZY(logging::Level::DEBUG,
-                        log << "SIMT: memory access per lane: " << mem->to_string() << logging::endl);
+                        log << "SIMT: memory access per work-item: " << mem->to_string() << logging::endl);
+                }
+                else if(vectorWidth > 1 && isRead && elementType.isVectorType())
+                {
+                    // a vector at a uniform address is the same for all work-items
+                    const Value dest = mem->getDestination();
+                    auto loaded = method.addNewLocal(elementType, "%simt_loaded");
+                    mem->setOutput(loaded);
+                    it.nextInBlock();
+                    auto repeated = method.addNewLocal(elementType.toVectorType(SIMT_WIDTH), "%simt_repeated");
+                    it = insertVectorReplication(it, method, loaded, repeated);
+                    assign(it, dest) = repeated;
+                    continue;
+                }
+            }
+
+            // 4. vector kernels: replicating element 0 (e.g. for splats and element extraction) replicates the first
+            // element of every work-item, and so does taking element 0 of a vector
+            auto move = it.get<MoveOperation>();
+            auto source = move ? move->getSource().checkLocal() : nullptr;
+            // also an element of a vector moved to the first lane by a rotation
+            auto sourceWriter = source ? dynamic_cast<const MoveOperation*>(source->getSingleWriter()) : nullptr;
+            bool isPerWorkItem = source &&
+                (vectorLocals.find(source) != vectorLocals.end() || analysis.isVarying(move->getSource()) ||
+                    (sourceWriter && sourceWriter->getVectorRotation()));
+            if(vectorWidth > 1 && isPerWorkItem && !move->getVectorRotation() && !move->hasConditionalExecution())
+            {
+                if(move->getOutput()->hasRegister(REG_REPLICATE_ALL))
+                {
+                    auto replicated = method.addNewLocal(source->type.toVectorType(SIMT_WIDTH), "%simt_replicated");
+                    insertWorkItemReplication(method, it, move->getSource(), replicated, vectorWidth, elementIndex);
+                    // the following read of the replicated value reads ours instead
+                    for(auto reader = it.copy().nextInBlock(); !reader.isEndOfBlock(); reader.nextInBlock())
+                    {
+                        if(!reader.has())
+                            continue;
+                        const auto args = reader->getArguments();
+                        bool found = false;
+                        for(std::size_t i = 0; i < args.size(); ++i)
+                        {
+                            if(args[i].hasRegister(REG_REPLICATE_ALL) || args[i].hasRegister(REG_ACC5))
+                            {
+                                reader->setArgument(i, replicated);
+                                found = true;
+                            }
+                        }
+                        if(found)
+                            break;
+                    }
+                    it.erase();
+                    continue;
+                }
+                auto out = move->checkOutputLocal();
+                if(out && vectorLocals.find(source) != vectorLocals.end() &&
+                    vectorLocals.find(out) == vectorLocals.end())
+                {
+                    // vector to scalar: element 0
+                    auto replicated = method.addNewLocal(source->type.toVectorType(SIMT_WIDTH), "%simt_element");
+                    insertWorkItemReplication(method, it, move->getSource(), replicated, vectorWidth, elementIndex);
+                    move->setSource(Value(replicated));
                 }
             }
             it.nextInBlock();
         }
     }
 
-    // 4. redirect all uses of the varying values to their vector versions
+    // 5. redirect all uses of the varying values to their vector versions
     for(auto& block : method)
     {
         for(auto& instr : block)
@@ -946,12 +1278,9 @@ static void convertToSIMT(Method& method, const Analysis& analysis)
         }
     }
 
-    // 5. memory stores only write back the elements of work-items in the work-group, which needs the local size and
+    // 6. memory stores only write back the elements of work-items in the work-group, which needs the local size and
     // the QPU's first local ID (see lowerWriteRAM in periphery/VPM.cpp). Read them here, so the UNIFORMs are loaded at
     // the start of the kernel.
-    auto startIt = method.walkAllInstructions();
-    if(!startIt.isEndOfMethod() && startIt.get<BranchLabel>())
-        startIt.nextInBlock();
     for(auto type : {BuiltinLocal::Type::LOCAL_SIZES, BuiltinLocal::Type::LOCAL_IDS})
     {
         auto builtin = method.findOrCreateBuiltin(type);
@@ -960,7 +1289,7 @@ static void convertToSIMT(Method& method, const Analysis& analysis)
         startIt.nextInBlock();
     }
 
-    method.metaData.mergedWorkItemsFactor = SIMT_WIDTH;
+    method.metaData.mergedWorkItemsFactor = workItemsPerQPU;
 }
 
 static DataType getMaskType()
@@ -1310,7 +1639,9 @@ void normalization::vectorizeWorkItems(Module& module, Method& method, const Con
     CPPLOG_LAZY(logging::Level::DEBUG, log << "SIMT: checking kernel '" << method.name << "':" << logging::endl);
     method.dumpInstructions();
 
-    auto reason = checkUnsupported(method);
+    std::string vectorTypes;
+    auto vectorWidth = determineVectorWidth(method, vectorTypes);
+    auto reason = vectorWidth ? checkUnsupported(method, vectorWidth) : "unsupported vector types:" + vectorTypes;
     if(reason.empty())
     {
         auto cf = determineControlFlow(method);
@@ -1330,14 +1661,16 @@ void normalization::vectorizeWorkItems(Module& module, Method& method, const Con
         else
             reason = findDivergentRegions(cf, [&](const Value& cond) { return analysis.isVarying(cond); }, regions);
         if(reason.empty())
-            reason = checkVaryingValues(method, analysis, cf, regions);
+            reason = checkVaryingValues(method, analysis, cf, regions, vectorWidth);
         if(reason.empty())
         {
-            convertToSIMT(method, analysis);
+            convertToSIMT(method, analysis, vectorWidth);
             linearizeDivergentControlFlow(method);
             CPPLOG_LAZY(logging::Level::INFO,
-                log << "SIMT: running kernel '" << method.name << "' with one work-item per SIMD lane ("
-                    << analysis.varying.size() << " work-item dependent values)" << logging::endl);
+                log << "SIMT: running kernel '" << method.name << "' with "
+                    << (vectorWidth > 1 ? std::to_string(vectorWidth) + " SIMD lanes per work-item" :
+                                          std::string("one work-item per SIMD lane"))
+                    << " (" << analysis.varying.size() << " work-item dependent values)" << logging::endl);
             return;
         }
     }

@@ -168,6 +168,38 @@ Not supported (the kernel falls back to the normal mode): control flow where a r
 between its entry and merge point, loops with several back edges or entered in the middle, and
 overlapping regions.
 
+### Vector kernels
+
+A kernel using vector types of a single width N (2, 4 or 8, 32-bit elements) runs 16 / N work-items per
+QPU, each in N adjacent SIMD lanes: lane = work-item × N + element. (16-element vectors already use
+all lanes.) The kernel header's merge factor is 16 / N.
+
+| Value | Layout |
+|---|---|
+| vector of a work-item | its N lanes |
+| scalar of a work-item | repeated in its N lanes |
+| uniform scalar | all lanes, as before |
+| uniform vector | repeated for every work-item |
+
+The front-end has already turned vector element accesses into rotations and conditional moves on the
+SIMD lanes when this pass runs. They are adapted:
+
+- the element number (`elem_num`) the front-end uses for element accesses becomes the element index
+  within the work-item (`elem_num & (N − 1)`), so inserting element k sets element k of every work-item;
+- replicating element 0 (splats, element extraction) replicates the first lane of every work-item
+  within its lanes, and so does taking element 0 of a vector;
+- rotations are kept, since the lanes read afterwards never cross the boundary between work-items.
+  Other uses of rotations (real shuffles) make the kernel fall back to the normal mode;
+- loads and stores of a work-item's own vector (`p[gid]` with `floatN* p`) access 16 consecutive
+  elements, like scalar SIMT. A scalar load of consecutive elements is expanded (work-item w's value
+  moves from lane w to its lanes), the load of one element of consecutive vectors (a vector load split
+  up by the front-end) is replicated from the work-item's first lane, and a scalar store is compacted
+  (lane w × N to lane w) and stores 16 / N elements.
+
+Not supported in vector kernels yet (the kernel falls back): mixed vector widths, vector parameters,
+non-splat vector constants, calls other than the work-item functions, divergent control flow, vector
+stores to uniform addresses and scalar stores to every N-th element.
+
 ### Switching SIMT mode on and off
 
 SIMT mode is on by default. It can be switched off, or back on, like an optimization pass:
@@ -265,9 +297,12 @@ the output buffer:
   `if`), local sizes 1 to 192 and up to 1,024 work-groups: all correct;
 - a reduction kernel with `__local` memory and a barrier (not SIMT): correct, reports 12; a kernel
   with a `__local` array but no barrier: not SIMT, reports 12;
-- kernels with independent work-items which don't qualify for SIMT mode: a `float4` kernel with
-  work-groups of 192, 100, 12 and NULL, and a 2-dimensional ID kernel (built with `--fno-simt`) with
+- a 2-dimensional ID kernel (built with `--fno-simt`, so its work-items run one per chunk) with
   work-groups of 8×8, 16×12, 12×2, 16×4 and 6×6: all correct;
+- vector kernels (widths 2, 4 and 8): vector loads and stores, splats of per-work-item scalars, uniform
+  vectors built from parameters, element extraction and horizontal sums, vectors built from scalar
+  loads, a loop of `mad`s like clpeak's, a swizzle LLVM turns into element accesses: bit-identical to
+  the normal mode for local sizes 192, 16, 12, 5 and NULL;
 - `VC4C_NO_SIMT=1`: same results in the normal mode.
 
 ## Results
@@ -276,16 +311,21 @@ Raspberry Pi 3B, V3D at 300 MHz, vc4 DRM backend.
 
 clpeak (local size chosen by clpeak from `CL_DEVICE_MAX_WORK_GROUP_SIZE`):
 
-| | before | SIMT, device limit 12 | SIMT, device limit 192 |
+| | before | scalar SIMT, device limit 192 | with vector SIMT |
 |---|---|---|---|
-| `float` compute | 0.61 GFLOPS | 6.60 GFLOPS | 9.29 GFLOPS (15×) |
-| `float2` / `float4` / `float8` (not SIMT) | 1.19 / 2.27 / 3.98 | unchanged | 1.16 / 2.23 / 4.06 |
-| `float16` compute (not SIMT) | 6.12 GFLOPS | 6.18 GFLOPS | 6.25 GFLOPS |
-| `int` compute | 0.18 GIOPS | 2.01 GIOPS | 2.82 GIOPS (16×) |
-| `int2` / `int4` / `int8` / `int16` (not SIMT) | 0.36 / 0.69 / 0.85 / 1.43 | unchanged | 0.35 / 0.68 / 0.79 / 1.35 |
+| `float` | 0.61 | 9.29 | 9.36 GFLOPS (15×) |
+| `float2` | 1.19 | 1.16 | 8.95 GFLOPS (7.5×) |
+| `float4` | 2.27 | 2.23 | 8.24 GFLOPS (3.6×) |
+| `float8` | 3.98 | 4.06 | 5.75 GFLOPS (1.4×) |
+| `float16` (not SIMT) | 6.12 | 6.25 | 6.35 GFLOPS |
+| `int` | 0.18 | 2.82 | 2.81 GIOPS (16×) |
+| `int2` | 0.36 | 0.35 | 2.76 GIOPS (7.7×) |
+| `int4` | 0.69 | 0.68 | 2.58 GIOPS (3.7×) |
+| `int8` | 0.85 | 0.79 | 1.88 GIOPS (2.2×) |
+| `int16` (not SIMT) | 1.43 | 1.35 | 1.35 GIOPS |
 
-The vector kernels don't qualify for SIMT mode, but have independent work-items, so they accept
-clpeak's work-groups of 192 (one work-item per chunk).
+All widths except 16 now use all SIMD lanes. The wider vectors gain less, since their work-items
+replicate and rotate more lanes for the horizontal sum at the end and run fewer work-items per QPU.
 
 clpeak's scalar global-bandwidth kernel (16 loads per work-item, `A[id + i * local_size]`), timed
 separately on 12 MB because clpeak's own bandwidth test couldn't allocate its 2 × 64 MB buffers on this
@@ -393,9 +433,9 @@ before, so most of these only matter for SIMT kernels.
 
 ## Future work
 
-- **SIMT for vector types.** A kernel using `floatN` could run 16 / N work-items per QPU, each in N
-  adjacent lanes. Element-wise arithmetic and contiguous `vloadN`/`vstoreN` work as they are, element
-  access, swizzles, scalar-to-vector conversions and horizontal operations need per-group code.
+- **More vector kernels:** divergent control flow, mixed vector widths, real shuffles and vector
+  parameters. The replication of a work-item's first lane uses N − 1 rotations; for N = 4 the QPU's
+  per-quad replication would do it in one instruction.
 - **Loop-variant addresses in divergent loops** (`p[i + k * n]`): the address of lane 0 can't be
   used once lane 0 has left the loop. Needs per-lane TMU addresses (with the lane's last valid address
   for inactive lanes).

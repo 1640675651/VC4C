@@ -1781,11 +1781,14 @@ NODISCARD static InstructionWalker lowerWriteRAM(
     Value dmaSetupBits = UNDEFINED_VALUE;
     auto vectorWidth = cacheEntry.getVectorWidth();
     auto mergeFactor = method.metaData.mergedWorkItemsFactor;
-    if(mergeFactor > 1 && vectorWidth.hasLiteral(Literal(static_cast<uint32_t>(mergeFactor))))
+    auto storedElements = vectorWidth.getLiteralValue();
+    if(mergeFactor > 1 && storedElements && storedElements->unsignedInt() % mergeFactor == 0)
     {
-        // SIMT mode: every element is the value of one work-item. A QPU runs up to 16 work-items of its work-group,
-        // starting at its first local ID, so only the first min(16, local_size(0) - first local ID) elements belong to
-        // work-items and may be written back.
+        // SIMT mode: the elements are the values of the QPU's work-items, the same number for every work-item (16
+        // scalars of 16 work-items, or in vector kernels a scalar or a vector of N elements per work-item). A QPU runs
+        // up to mergeFactor work-items of its work-group, starting at its first local ID, so only the elements of the
+        // first min(mergeFactor, local_size(0) - first local ID) work-items may be written back.
+        auto elementsPerWorkItem = storedElements->unsignedInt() / mergeFactor;
         auto localSizes = method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_SIZES)->createReference();
         auto localIds = method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_IDS)->createReference();
         auto localSizeX = assign(it, TYPE_INT32, "%simt_local_size_x") =
@@ -1793,8 +1796,14 @@ NODISCARD static InstructionWalker lowerWriteRAM(
         auto firstLocalId = assign(it, TYPE_INT32, "%simt_first_local_id") =
             (localIds & Value(Literal(0xFFu), TYPE_INT32));
         auto remainingItems = assign(it, TYPE_INT32, "%simt_remaining_items") = (localSizeX - firstLocalId);
-        vectorWidth = assign(it, TYPE_INT8, "%simt_active_lanes") =
+        auto activeItems = assign(it, TYPE_INT32, "%simt_active_work_items") =
             min(as_signed{remainingItems}, as_signed{Value(Literal(static_cast<uint32_t>(mergeFactor)), TYPE_INT32)});
+        // the elements per work-item are a power of two (the vector width)
+        uint32_t shift = 0;
+        while((1u << shift) < elementsPerWorkItem)
+            ++shift;
+        vectorWidth = assign(it, TYPE_INT8, "%simt_active_lanes") =
+            (activeItems << Value(Literal(shift), TYPE_INT8));
     }
     // TODO this assumes 1 row = 1 entry, is this always correct?
     it = insertWriteDMASetup(it, dmaSetupBits, cacheEntry.area, cacheEntry.getScalarType(), vectorWidth, numEntries);
