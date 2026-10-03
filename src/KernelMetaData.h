@@ -66,9 +66,9 @@ namespace vc4c
         {
             if(auto fixedSize = getFixedWorkGroupSize())
                 return *fixedSize;
-            // With merged work-items (SIMT mode), a work-group runs on a single QPU
+            // With merged work-items (SIMT mode), every QPU runs up to mergedWorkItemsFactor work-items
             if(mergedWorkItemsFactor > 1)
-                return mergedWorkItemsFactor;
+                return NUM_QPUS * mergedWorkItemsFactor;
             return NUM_QPUS;
         }
 

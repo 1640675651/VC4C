@@ -23,9 +23,9 @@ namespace vc4c
          * doc/SIMT.md).
          *
          * Every value which differs between work-items is converted into a 16-element vector (one element per
-         * work-item), all other values stay as they are. Only kernels whose control flow is uniform across the
-         * work-items are converted, and only if all their memory accesses with work-item dependent addresses are
-         * contiguous across the work-items. Other kernels are left unchanged.
+         * work-item), all other values stay as they are. Divergent branches and loops are linearized and run
+         * with masks of active lanes. Only kernels whose memory accesses with work-item dependent addresses are
+         * contiguous across the work-items are converted. Other kernels are left unchanged.
          *
          * Needs to run before the work-item functions are intrinsified. Can be disabled with --fno-simt or by setting
          * the environment variable VC4C_NO_SIMT.

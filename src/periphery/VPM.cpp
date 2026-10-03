@@ -1783,10 +1783,18 @@ NODISCARD static InstructionWalker lowerWriteRAM(
     auto mergeFactor = method.metaData.mergedWorkItemsFactor;
     if(mergeFactor > 1 && vectorWidth.hasLiteral(Literal(static_cast<uint32_t>(mergeFactor))))
     {
-        // SIMT mode: every element is the value of one work-item. With one work-group per QPU, only the first
-        // local_size(0) elements belong to work-items, so only those may be written back.
+        // SIMT mode: every element is the value of one work-item. A QPU runs up to 16 work-items of its work-group,
+        // starting at its first local ID, so only the first min(16, local_size(0) - first local ID) elements belong to
+        // work-items and may be written back.
         auto localSizes = method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_SIZES)->createReference();
-        vectorWidth = assign(it, TYPE_INT8, "%simt_active_lanes") = (localSizes & Value(Literal(0xFFu), TYPE_INT32));
+        auto localIds = method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_IDS)->createReference();
+        auto localSizeX = assign(it, TYPE_INT32, "%simt_local_size_x") =
+            (localSizes & Value(Literal(0xFFu), TYPE_INT32));
+        auto firstLocalId = assign(it, TYPE_INT32, "%simt_first_local_id") =
+            (localIds & Value(Literal(0xFFu), TYPE_INT32));
+        auto remainingItems = assign(it, TYPE_INT32, "%simt_remaining_items") = (localSizeX - firstLocalId);
+        vectorWidth = assign(it, TYPE_INT8, "%simt_active_lanes") =
+            min(as_signed{remainingItems}, as_signed{Value(Literal(static_cast<uint32_t>(mergeFactor)), TYPE_INT32)});
     }
     // TODO this assumes 1 row = 1 entry, is this always correct?
     it = insertWriteDMASetup(it, dmaSetupBits, cacheEntry.area, cacheEntry.getScalarType(), vectorWidth, numEntries);
