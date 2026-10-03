@@ -200,13 +200,13 @@ static std::string checkUnsupported(const Method& method)
         {
             if(!instr)
                 continue;
-            if(dynamic_cast<const MemoryBarrier*>(instr.get()) || dynamic_cast<const SemaphoreAdjustment*>(instr.get()) ||
-                dynamic_cast<const MutexLock*>(instr.get()))
+            if(dynamic_cast<const MemoryBarrier*>(instr.get()) ||
+                dynamic_cast<const SemaphoreAdjustment*>(instr.get()) || dynamic_cast<const MutexLock*>(instr.get()))
                 return "uses synchronization: " + instr->to_string();
             if(auto call = dynamic_cast<const MethodCall*>(instr.get()))
             {
-                for(const char* unsupported :
-                    {"barrier", "atomic", "mutex", "semaphore", "dma", "vpm", "fence", "async", "prefetch", "linear_id"})
+                for(const char* unsupported : {"barrier", "atomic", "mutex", "semaphore", "dma", "vpm", "fence", "async",
+                        "prefetch", "linear_id"})
                 {
                     if(call->methodName.find(unsupported) != std::string::npos)
                         return "calls " + call->methodName;
@@ -229,6 +229,16 @@ static std::string checkUnsupported(const Method& method)
             });
             if(unsupportedType)
                 return "uses vector or 64-bit values: " + instr->to_string();
+            bool usesLocalMemory = false;
+            // also finds the __local variables of the kernel, which are globals. The work-groups running at the same
+            // time would share them.
+            instr->forUsedLocals([&](const Local* loc, LocalUse::Type, const IntermediateInstruction&) {
+                auto ptrType = loc->type.getPointerType();
+                if(ptrType && ptrType->addressSpace == AddressSpace::LOCAL)
+                    usesLocalMemory = true;
+            });
+            if(usesLocalMemory)
+                return "uses __local memory: " + instr->to_string();
         }
     }
     return "";
@@ -399,9 +409,9 @@ static ControlFlow determineControlFlow(Method& method)
  * supported.
  *
  * The region contains all blocks between its entry block and its merge block, which must be exactly the blocks reached
- * from the entry before reaching the merge block. If the divergent branch is inside a loop, the lanes may leave the loop
- * in different iterations, so the region grows to contain the whole loop: its entry is then the block before the loop
- * header. Loops in the region need to consist of consecutive blocks with the header first and the only back edge from
+ * from the entry before reaching the merge block. If the divergent branch is inside a loop, the lanes may leave the
+ * loop in different iterations, so the region grows to contain the whole loop: its entry is then the block before the
+ * loop header. Loops in the region need to consist of consecutive blocks with the header first and the only back edge from
  * the last block (the latch).
  */
 static std::string determineRegion(const ControlFlow& cf, std::size_t branchBlock, Region& region)

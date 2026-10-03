@@ -956,16 +956,58 @@ static bool insertSynchronizationBlock(Method& method, BasicBlock& lastBlock)
 }
 
 /*
- * In SIMT mode, every QPU runs whole work-groups independently of the other QPUs. The run-time passes every QPU one
- * block of UNIFORMs (including the group IDs) per work-group it runs, each followed by a flag whether another block
- * follows. So the loop simply re-runs the kernel code (which reads the next block) while the flag is set.
- *
- * Without this loop, every launch could only run one work-group per QPU.
+ * Whether the work-items of the kernel never interact: no barriers or other synchronization between them and no
+ * __local memory. Then the run-time may run the work-items of a work-group on any QPUs in any order, e.g. several
+ * work-items of a work-group one after the other on the same QPU (see addIndependentWorkGroupLoop).
  */
-static std::size_t addSIMTWorkGroupLoop(Method& method)
+static bool hasIndependentWorkItems(const Method& method)
+{
+    if(has_flag(method.flags, MethodFlags::LEADING_CONTROL_FLOW_BARRIER) ||
+        has_flag(method.flags, MethodFlags::TRAILING_CONTROL_FLOW_BARRIER))
+        return false;
+    auto isLocalMemory = [](const DataType& type) -> bool {
+        auto ptrType = type.getPointerType();
+        return ptrType && ptrType->addressSpace == AddressSpace::LOCAL;
+    };
+    for(const auto& param : method.parameters)
+    {
+        if(isLocalMemory(param.type))
+            return false;
+    }
+    for(const auto& block : method)
+    {
+        for(const auto& instr : block)
+        {
+            if(!instr)
+                continue;
+            if(dynamic_cast<const intermediate::SemaphoreAdjustment*>(instr.get()))
+                return false;
+            bool usesLocalMemory = false;
+            // also finds the __local variables of the kernel, which are globals
+            instr->forUsedLocals([&](const Local* loc, LocalUse::Type, const intermediate::IntermediateInstruction&) {
+                if(isLocalMemory(loc->type))
+                    usesLocalMemory = true;
+            });
+            if(usesLocalMemory)
+                return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Every QPU runs chunks of work-items (with SIMT mode 16 work-items, otherwise a single one) independently of the
+ * other QPUs. The run-time passes every QPU one block of UNIFORMs (including the group and local IDs) per chunk it
+ * runs, each followed by a flag whether another block follows. So the loop simply re-runs the kernel code (which reads
+ * the next block) while the flag is set.
+ *
+ * This requires work-items which don't interact (see hasIndependentWorkItems), which is always the case in SIMT mode.
+ * Then work-groups may have more work-items than there are QPUs, and a single launch runs any number of work-groups.
+ */
+static std::size_t addIndependentWorkGroupLoop(Method& method)
 {
     CPPLOG_LAZY(logging::Level::DEBUG,
-        log << "Wrapping SIMT kernel " << method.name << " in a work-group loop..." << logging::endl);
+        log << "Wrapping kernel " << method.name << " in a loop over independent work-items..." << logging::endl);
     auto& defaultBlock = *method.begin();
     if(defaultBlock.empty())
         return 0u;
@@ -1011,8 +1053,8 @@ std::size_t optimizations::addWorkGroupLoop(const Module& module, Method& method
 {
     if(method.walkAllInstructions().isEndOfMethod())
         return 0u;
-    if(method.metaData.mergedWorkItemsFactor > 1)
-        return addSIMTWorkGroupLoop(method);
+    if(method.metaData.mergedWorkItemsFactor > 1 || hasIndependentWorkItems(method))
+        return addIndependentWorkGroupLoop(method);
     CPPLOG_LAZY(
         logging::Level::DEBUG, log << "Wrapping kernel " << method.name << " in a work-group loop..." << logging::endl);
 

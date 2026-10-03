@@ -66,10 +66,10 @@ namespace vc4c
         {
             if(auto fixedSize = getFixedWorkGroupSize())
                 return *fixedSize;
-            // With merged work-items (SIMT mode), every QPU runs up to mergedWorkItemsFactor work-items
-            if(mergedWorkItemsFactor > 1)
-                return NUM_QPUS * mergedWorkItemsFactor;
-            return NUM_QPUS;
+            // Work-groups of kernels with independent work-items (always in SIMT mode) are split into chunks of
+            // work-items run by any QPU, so they may have up to 16 work-items per QPU. Only kernels with barriers or
+            // __local memory are limited to one work-item per QPU, but this is only known after normalization.
+            return NUM_QPUS * NATIVE_VECTOR_SIZE;
         }
 
         /**

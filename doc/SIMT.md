@@ -36,16 +36,21 @@ In SIMT mode **a QPU runs 16 work-items at a time, one per SIMD lane**:
 
 ### Modes and work-group size limits
 
-The device limits must hold for every kernel, and kernels which don't qualify for SIMT mode still run
-one work-item per QPU (at most 12 per work-group). So the mode is chosen per process, before anything
-is compiled:
+The chunk scheduling works for any kernel whose work-items never interact (no barriers, no `__local`
+memory), also for kernels which don't qualify for SIMT mode: their chunks are a single work-item, in
+any dimension. Only kernels with barriers or `__local` memory still need all work-items of a
+work-group running at the same time, one per QPU, so at most 12 per work-group.
+
+The device limits must hold for every kernel, so the mode is chosen per process, before anything is
+compiled:
 
 | | SIMT mode (default) | classic mode (`VC4CL_NO_SIMT=1`) |
 |---|---|---|
 | `CL_DEVICE_MAX_WORK_GROUP_SIZE` | 192 | 12 |
-| `CL_DEVICE_MAX_WORK_ITEM_SIZES` | 192, 12, 12 | 12, 12, 12 |
-| `CL_KERNEL_WORK_GROUP_SIZE` of SIMT kernels | 192 | (no SIMT kernels) |
-| `CL_KERNEL_WORK_GROUP_SIZE` of other kernels | 12 | 12 |
+| `CL_DEVICE_MAX_WORK_ITEM_SIZES` | 192, 192, 192 | 12, 12, 12 |
+| `CL_KERNEL_WORK_GROUP_SIZE`, SIMT kernels (1-dimensional work-groups) | 192 | (no SIMT kernels) |
+| `CL_KERNEL_WORK_GROUP_SIZE`, other kernels with independent work-items | 192 | 12 |
+| `CL_KERNEL_WORK_GROUP_SIZE`, kernels with barriers or `__local` memory | 12 | 12 |
 
 A kernel may report a lower limit than the device, as OpenCL allows. In classic mode, VC4CL compiles
 every kernel with `--fno-simt`.
@@ -92,7 +97,7 @@ work-item functions are intrinsified. It converts a kernel only if:
 
 - all its locals are scalars of at most 32 bits or pointers (no vector types, no 64-bit values);
 - it uses no barriers, atomics, mutexes, semaphores, async copies/prefetches, `get_global_linear_id`,
-  `__local` pointer parameters or stack allocations (private arrays);
+  `__local` memory (parameters or variables) or stack allocations (private arrays);
 - every memory access reads or writes a single element; no `memcpy`/`memset`-style accesses;
 - every work-item dependent address has a lane stride equal to the element size (`p[gid + c]`,
   `p[get_local_id(0)]`, …), i.e. the 16 lanes access 16 consecutive elements;
@@ -198,16 +203,18 @@ Other changes for SIMT kernels (`mergedWorkItemsFactor > 1`):
 
 | Where | What |
 |---|---|
-| `KernelMetaData.h` | Maximum work-group size = 12 QPUs × merge factor; maximum instances = 12 QPUs |
-| `optimization/ControlFlow.cpp` (`addWorkGroupLoop`) | SIMT work-group loop instead of the normal one (see below) |
+| `KernelMetaData.h` | Maximum work-group size = 192 for all kernels (used for the value ranges of the work-item IDs, only known to be smaller after normalization); maximum instances = 12 QPUs |
+| `optimization/ControlFlow.cpp` (`addWorkGroupLoop`) | Loop over independent work-items instead of the normal one, for SIMT kernels and all kernels without barriers and `__local` memory (see below) |
+| `tools/Emulator.cpp` (`buildUniforms`) | Deals the chunks of all work-groups across the QPUs like VC4CL |
 | `periphery/VPM.cpp` (`lowerWriteRAM`) | A 16-wide store DMAs `min(16, local_size − first_local_id)` words instead of 16 |
 | `normalization/MemoryAccess.cpp` | The check for memory dependencies between work-items accounts for the 16 work-items per QPU. Without it every SIMT kernel got a work-group barrier |
 
 ### Work-group loop
 
 The normal work-group loop runs all work-groups on all QPUs in lockstep: every iteration ends with a
-barrier, and the group IDs are counted up in the kernel. In SIMT mode the QPUs run different
-work-groups independently, so the loop is different:
+barrier, and the group IDs are counted up in the kernel. Kernels with independent work-items (all
+SIMT kernels, and all other kernels without barriers and `__local` memory) let the QPUs run chunks of
+different work-groups independently, so their loop is different:
 
 - VC4CL writes one block of UNIFORMs per chunk a QPU runs (with the chunk's group IDs and first local
   ID), all of a QPU's blocks one after another. Each block ends with a *next group* flag (new
@@ -234,9 +241,9 @@ run, one work-group per QPU and launch.
   rejected with `CL_INVALID_WORK_GROUP_SIZE`. Without a given local size, VC4CL picks the largest
   divisor of the global size up to that limit (OpenCL 1.2 requires the local size to divide the
   global size).
-- `executor.cpp`: for SIMT kernels, the chunks of 16 work-items of all work-groups are dealt across
-  the QPUs through the work-group loop above. Without the loop flag, one work-group per QPU is
-  launched in batches of up to 12.
+- `executor.cpp`: for kernels with independent work-items, the chunks (16 work-items in SIMT mode,
+  otherwise 1) of all work-groups are dealt across the QPUs through the work-group loop above. SIMT
+  kernels without the loop flag run one work-group per QPU, launched in batches of up to 12.
 - `Program.cpp`: the `--fsimt`/`--fno-simt` build options, and `--fno-simt` in classic mode.
 
 ## Testing
@@ -256,7 +263,11 @@ the output buffer:
 - divergent loops (collatz with two exit conditions, a store inside a divergent loop, a divergent
   loop with a divergent `if` and a `break` inside a bounds check, a uniform loop around a divergent
   `if`), local sizes 1 to 192 and up to 1,024 work-groups: all correct;
-- a reduction kernel with `__local` memory and a barrier (not SIMT): correct, reports 12;
+- a reduction kernel with `__local` memory and a barrier (not SIMT): correct, reports 12; a kernel
+  with a `__local` array but no barrier: not SIMT, reports 12;
+- kernels with independent work-items which don't qualify for SIMT mode: a `float4` kernel with
+  work-groups of 192, 100, 12 and NULL, and a 2-dimensional ID kernel (built with `--fno-simt`) with
+  work-groups of 8×8, 16×12, 12×2, 16×4 and 6×6: all correct;
 - `VC4C_NO_SIMT=1`: same results in the normal mode.
 
 ## Results
@@ -267,9 +278,14 @@ clpeak (local size chosen by clpeak from `CL_DEVICE_MAX_WORK_GROUP_SIZE`):
 
 | | before | SIMT, device limit 12 | SIMT, device limit 192 |
 |---|---|---|---|
-| `float` compute | 0.61 GFLOPS | 6.60 GFLOPS | 9.36 GFLOPS (15×) |
-| `int` compute | 0.18 GIOPS | 2.01 GIOPS | 2.83 GIOPS (16×) |
-| `float16` compute (not SIMT, for reference) | 6.12 GFLOPS | 6.18 GFLOPS | fails, see Caveats |
+| `float` compute | 0.61 GFLOPS | 6.60 GFLOPS | 9.29 GFLOPS (15×) |
+| `float2` / `float4` / `float8` (not SIMT) | 1.19 / 2.27 / 3.98 | unchanged | 1.16 / 2.23 / 4.06 |
+| `float16` compute (not SIMT) | 6.12 GFLOPS | 6.18 GFLOPS | 6.25 GFLOPS |
+| `int` compute | 0.18 GIOPS | 2.01 GIOPS | 2.82 GIOPS (16×) |
+| `int2` / `int4` / `int8` / `int16` (not SIMT) | 0.36 / 0.69 / 0.85 / 1.43 | unchanged | 0.35 / 0.68 / 0.79 / 1.35 |
+
+The vector kernels don't qualify for SIMT mode, but have independent work-items, so they accept
+clpeak's work-groups of 192 (one work-item per chunk).
 
 clpeak's scalar global-bandwidth kernel (16 loads per work-item, `A[id + i * local_size]`), timed
 separately on 12 MB because clpeak's own bandwidth test couldn't allocate its 2 × 64 MB buffers on this
@@ -330,11 +346,11 @@ before, so most of these only matter for SIMT kernels.
 - SIMT kernels support only 1-dimensional work-groups, of up to 192 work-items. Multi-dimensional
   local sizes fail with `CL_INVALID_WORK_GROUP_SIZE`, even though the same kernel would accept them in
   the normal mode (up to 12). Use `--fno-simt` for such launches.
-- **Kernels that don't qualify for SIMT mode report `CL_KERNEL_WORK_GROUP_SIZE` 12, below the device
+- **Kernels with barriers or `__local` memory report `CL_KERNEL_WORK_GROUP_SIZE` 12, below the device
   limit of 192.** OpenCL allows this, but applications which use the device limit as their local size
-  without checking the kernel's limit fail with `CL_INVALID_WORK_GROUP_SIZE` for such kernels. clpeak
-  does this: its vector tests (`float2`…, `int2`…) fail in SIMT mode. Classic mode
-  (`VC4CL_NO_SIMT=1`) avoids it, at the cost of SIMT mode.
+  without checking the kernel's limit fail with `CL_INVALID_WORK_GROUP_SIZE` for such kernels. Classic
+  mode (`VC4CL_NO_SIMT=1`) avoids it, at the cost of SIMT mode. Kernels without barriers or `__local`
+  memory accept 192 in either case, also if they don't qualify for SIMT mode.
 - Without a given local size, VC4CL picks the largest divisor of the global size up to 192: a global
   size of 100 gives a single work-group of 100 (7 chunks, the last with 4 active lanes).
 
@@ -363,8 +379,9 @@ before, so most of these only matter for SIMT kernels.
 - Binaries from this VC4C need this VC4CL: older VC4CL versions don't write the "next group" flag
   (`NextGroupFlagUsed`, bit 17), so SIMT kernels would read garbage. Older binaries (without the flag
   or merge factor) run unchanged on the new VC4CL. Install both together.
-- VC4C's own emulator (`tools/Emulator.cpp`, used by VC4C's tests) runs SIMT kernels for a single
-  work-group only. Multiple work-groups need VC4CL's emulator mode (`VC4CL_EMULATOR=1`).
+- VC4C's own emulator (`tools/Emulator.cpp`, used by VC4C's tests) deals chunks across the QPUs like
+  VC4CL. This code is untested: VC4CL's emulator mode (`VC4CL_EMULATOR=1`, used for all tests here)
+  builds its own UNIFORMs, and VC4C's tests aren't built on this system.
 - VC4CL's debug memory dumps and performance counters haven't been tested with SIMT kernels.
 
 ### Not SIMT related, but seen during testing
@@ -376,10 +393,9 @@ before, so most of these only matter for SIMT kernels.
 
 ## Future work
 
-- **Larger work-groups for barrier-free kernels in the normal mode.** A kernel without barriers or
-  `__local` memory could also use the chunk scheduling (with one work-item per chunk), and accept
-  work-groups up to 192. Then only kernels with barriers would stay limited to 12, which fixes most
-  applications that ignore `CL_KERNEL_WORK_GROUP_SIZE` (clpeak's vector tests).
+- **SIMT for vector types.** A kernel using `floatN` could run 16 / N work-items per QPU, each in N
+  adjacent lanes. Element-wise arithmetic and contiguous `vloadN`/`vstoreN` work as they are, element
+  access, swizzles, scalar-to-vector conversions and horizontal operations need per-group code.
 - **Loop-variant addresses in divergent loops** (`p[i + k * n]`): the address of lane 0 can't be
   used once lane 0 has left the loop. Needs per-lane TMU addresses (with the lane's last valid address
   for inactive lanes).

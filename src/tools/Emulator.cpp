@@ -2440,62 +2440,85 @@ std::vector<MemoryAddress> tools::buildUniforms(Memory& memory, MemoryAddress ba
 {
     std::vector<MemoryAddress> res;
 
-    Word numQPUs = (config.localSizes[0] * config.localSizes[1] * config.localSizes[2]);
-    numQPUs = numQPUs / workItemMergeFactor + (numQPUs % workItemMergeFactor != 0);
+    // the work-items of a work-group are run in chunks of workItemMergeFactor work-items (in dimension 0) per QPU
+    const std::array<Word, 3> chunkSizes = {
+        config.localSizes[0] / workItemMergeFactor + (config.localSizes[0] % workItemMergeFactor != 0),
+        config.localSizes[1], config.localSizes[2]};
+    const Word chunksPerGroup = chunkSizes[0] * chunkSizes[1] * chunkSizes[2];
+    const Word numGroups = config.numGroups[0] * config.numGroups[1] * config.numGroups[2];
+    auto unflatten = [](Word index, const std::array<Word, 3>& sizes) -> std::array<Word, 3> {
+        return {index % sizes[0], (index / sizes[0]) % sizes[1], index / (sizes[0] * sizes[1])};
+    };
+
+    // With the loop over independent work-items, every QPU runs one chunk per block of UNIFORMs, of any work-group,
+    // until the "next group" flag is not set (see VC4CL's executor.cpp). Otherwise, all QPUs run the chunks of a single
+    // work-group together and loop over the work-groups.
+    const bool independentWorkItems = uniformsUsed.getNextGroupFlagUsed();
+    const Word numChunks = independentWorkItems ? chunksPerGroup * numGroups : chunksPerGroup;
+    const Word numQPUs = std::min(numChunks, static_cast<Word>(NUM_QPUS));
     res.reserve(numQPUs);
 
-    std::vector<Word> qpuUniforms;
-    qpuUniforms.resize(uniformsUsed.countUniforms() + parameter.size());
-
-    if((config.numGroups[0] > 1 || config.numGroups[1] > 1 || config.numGroups[2] > 1) &&
+    if(!independentWorkItems && numGroups > 1 &&
         !(uniformsUsed.getMaxGroupIDXUsed() && uniformsUsed.getMaxGroupIDYUsed() && uniformsUsed.getMaxGroupIDZUsed()))
         throw CompilationError(CompilationStep::GENERAL,
             "Emulator of multiple work-groups requires work-group-loop optimization to be enabled!");
 
-    for(uint32_t q = 0; q < numQPUs; ++q)
-    {
-        std::array<Word, 3> localIDs = {q % config.localSizes[0], (q / config.localSizes[0]) % config.localSizes[1],
-            (q / config.localSizes[0]) / config.localSizes[1]};
-
-        std::size_t i = 0;
+    auto appendBlock = [&](std::vector<Word>& qpuUniforms, MemoryAddress qpuAddress,
+                           const std::array<Word, 3>& groupIDs, const std::array<Word, 3>& chunkIDs, Word nextGroup) {
         if(uniformsUsed.getWorkDimensionsUsed())
-            qpuUniforms[i++] = config.dimensions;
+            qpuUniforms.push_back(config.dimensions);
         if(uniformsUsed.getLocalSizesUsed())
-            qpuUniforms[i++] = (config.localSizes[2] << 16) | (config.localSizes[1] << 8) | config.localSizes[0];
+            qpuUniforms.push_back((config.localSizes[2] << 16) | (config.localSizes[1] << 8) | config.localSizes[0]);
         if(uniformsUsed.getLocalIDsUsed())
-            qpuUniforms[i++] = (localIDs[2] << 16) | (localIDs[1] << 8) | (localIDs[0] * workItemMergeFactor);
+            qpuUniforms.push_back((chunkIDs[2] << 16) | (chunkIDs[1] << 8) | (chunkIDs[0] * workItemMergeFactor));
         if(uniformsUsed.getNumGroupsXUsed())
-            qpuUniforms[i++] = config.numGroups[0];
+            qpuUniforms.push_back(config.numGroups[0]);
         if(uniformsUsed.getNumGroupsYUsed())
-            qpuUniforms[i++] = config.numGroups[1];
+            qpuUniforms.push_back(config.numGroups[1]);
         if(uniformsUsed.getNumGroupsZUsed())
-            qpuUniforms[i++] = config.numGroups[2];
+            qpuUniforms.push_back(config.numGroups[2]);
         if(uniformsUsed.getGroupIDXUsed())
-            qpuUniforms[i++] = 0; // is only set for single work-groups
+            qpuUniforms.push_back(groupIDs[0]);
         if(uniformsUsed.getGroupIDYUsed())
-            qpuUniforms[i++] = 0; // is only set for single work-groups
+            qpuUniforms.push_back(groupIDs[1]);
         if(uniformsUsed.getGroupIDZUsed())
-            qpuUniforms[i++] = 0; // is only set for single work-groups
+            qpuUniforms.push_back(groupIDs[2]);
         if(uniformsUsed.getGlobalOffsetXUsed())
-            qpuUniforms[i++] = config.globalOffsets[0];
+            qpuUniforms.push_back(config.globalOffsets[0]);
         if(uniformsUsed.getGlobalOffsetYUsed())
-            qpuUniforms[i++] = config.globalOffsets[1];
+            qpuUniforms.push_back(config.globalOffsets[1]);
         if(uniformsUsed.getGlobalOffsetZUsed())
-            qpuUniforms[i++] = config.globalOffsets[2];
+            qpuUniforms.push_back(config.globalOffsets[2]);
         if(uniformsUsed.getGlobalDataAddressUsed())
-            qpuUniforms[i++] = globalData;
+            qpuUniforms.push_back(globalData);
         for(auto param : parameter)
-            qpuUniforms[i++] = param;
+            qpuUniforms.push_back(param);
         if(uniformsUsed.getUniformAddressUsed())
-            qpuUniforms[i++] = baseAddress;
+            qpuUniforms.push_back(qpuAddress);
         if(uniformsUsed.getMaxGroupIDXUsed())
-            qpuUniforms[i++] = config.numGroups[0];
+            qpuUniforms.push_back(config.numGroups[0]);
         if(uniformsUsed.getMaxGroupIDYUsed())
-            qpuUniforms[i++] = config.numGroups[1];
+            qpuUniforms.push_back(config.numGroups[1]);
         if(uniformsUsed.getMaxGroupIDZUsed())
-            qpuUniforms[i++] = config.numGroups[2];
+            qpuUniforms.push_back(config.numGroups[2]);
         if(uniformsUsed.getNextGroupFlagUsed())
-            qpuUniforms[i++] = 0; // every QPU runs a single work-group
+            qpuUniforms.push_back(nextGroup);
+    };
+
+    for(Word q = 0; q < numQPUs; ++q)
+    {
+        std::vector<Word> qpuUniforms;
+        // QPU q runs the chunks q, q + numQPUs, q + 2 * numQPUs, ...
+        for(Word chunk = q; chunk < numChunks; chunk += numQPUs)
+        {
+            // the group IDs are only set here for independent work-items, the work-group loop counts them otherwise
+            auto groupIDs = independentWorkItems ? unflatten(chunk / chunksPerGroup, config.numGroups) :
+                                                   std::array<Word, 3>{0, 0, 0};
+            appendBlock(qpuUniforms, baseAddress, groupIDs, unflatten(chunk % chunksPerGroup, chunkSizes),
+                chunk + numQPUs < numChunks ? 1u : 0u);
+            if(!independentWorkItems)
+                break;
+        }
 
         memory.setUniforms(qpuUniforms, baseAddress);
         res.emplace_back(baseAddress);
@@ -2675,7 +2698,8 @@ static Memory fillMemory(const StableList<Global>& globalData, const EmulationDa
         size += 64;
     while((size % 64) != 0)
         ++size;
-    size += settings.calcNumWorkItems() * (16 + settings.parameter.size());
+    // one block of UNIFORMs per work-item at most (see buildUniforms)
+    size += settings.calcNumWorkItems() * (20 + settings.parameter.size());
     Memory mem(size);
 
     MemoryAddress currentAddress = 0;
