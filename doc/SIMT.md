@@ -431,19 +431,116 @@ before, so most of these only matter for SIMT kernels.
   memory pressure the kernel can't free 64 MB of contiguous memory. Reporting a quarter would let
   clpeak pick 2 × 32 MB.
 
-## Future work
+## Roadmap to a conformant SIMT implementation
 
-- **More vector kernels:** divergent control flow, mixed vector widths, real shuffles and vector
-  parameters. The replication of a work-item's first lane uses N − 1 rotations; for N = 4 the QPU's
-  per-quad replication would do it in one instruction.
-- **Loop-variant addresses in divergent loops** (`p[i + k * n]`): the address of lane 0 can't be
-  used once lane 0 has left the loop. Needs per-lane TMU addresses (with the lane's last valid address
-  for inactive lanes).
-- **Faster partial stores.** A prefix of active lanes (the bounds check) needs only one shorter DMA
-  instead of the lane loop.
-- **Non-contiguous loads** (`p[idx[gid]]`) need a safe address for inactive lanes before the TMU
-  request, since TMU requests can't be masked.
+Goal: the OpenCL conformance tests (OpenCL-CTS) pass in SIMT mode exactly as in classic mode, and as
+many kernels as possible run in SIMT mode. Kernels which don't qualify fall back to the classic code,
+so most items below are about coverage and speed; correctness depends on the fallback being exact,
+and on the compiler being correct in both modes (see step 1).
 
-Other extensions: 2- and 3-dimensional work-groups (needs the local-ID packing in VC4CL's
-`executor.cpp` and the emulator's `buildUniforms` to handle per-lane x/y/z), non-contiguous accesses
-(per-lane TMU addresses work as is; stores need the per-lane DMA above).
+### 1. Verification first
+
+- **Run OpenCL-CTS** (github.com/KhronosGroup/OpenCL-CTS; VC4CL already contains workarounds for
+  its 1.2 version, `cl12_trunk`) in both modes and compare the pass lists. Start with `basic`,
+  `compiler`, `api`, `vectors`, `relationals`, `commonfns`, `integer_ops` and `geometrics`; the
+  `math_brute_force` and `conversions` suites take hours to days on this GPU. Build only the
+  selected test directories, single job (`make -j1`).
+- **Check results against independently computed values**, not only SIMT against classic mode:
+  both modes share the front-end and most of the backend, so a compiler bug produces the same wrong
+  result in both (see the `switch` bug below, which a mode comparison didn't catch).
+- **Check which mode every test kernel actually used** (the INFO log line), since results alone
+  don't show a silent fallback.
+- **Run VC4C's own test suite** (`testing/`) with its emulator. Its `buildUniforms` now deals chunks
+  across the QPUs like VC4CL, untested so far.
+
+### 2. Known bugs (both modes)
+
+- Fixed: **irregular integer types were widened without masking.** LLVM narrows values to types like
+  `i2` (e.g. for `switch (v & 3)`), which the front-end extends to `i8`. The truncation masked with
+  `0xFF` instead of `0x3`, and negative constants were sign-extended, so `switch (v & 3)` took the
+  default case for most values. Now the values of such types are kept zero-extended to their actual
+  width (`llvm/BitcodeReader.cpp`): truncations, `add`/`sub`/`mul`/`shl` and constants are masked,
+  `ashr`/`sdiv`/`srem`, signed comparisons and `sext` first sign-extend from the actual width.
+- Unexplained: **a kernel argument read wrong by the second program of a process.** A host program
+  building and running the `switch` kernel twice (two contexts one after the other, the second build
+  with `--fno-simt`; both builds produce the same code) gets results computed with the kernel argument
+  `n` = 7 instead of 9 from the second run, in 6 of 200 runs, for all work-items using `n` on all
+  QPUs. Running a single program per process never showed it (100 runs, checked against the host).
+  So one UNIFORM value seems wrong for the whole launch. Candidates: the uniform cache flush before a
+  compute job (`vc4_compute_start` flushes the caches and immediately starts the QPUs; the second
+  program's buffers likely reuse the first one's physical memory), or the CPU's write-combined
+  writes of the UNIFORMs.
+
+### 3. Barriers and `__local` memory in SIMT mode
+
+Today these kernels run in classic mode, at most 12 work-items per work-group (one per QPU).
+
+1. **Work-groups of up to 16 work-items (one QPU).** `barrier()` becomes a memory fence: the
+   work-items are lanes of one instruction stream, so only outstanding stores need to finish.
+   Typical barrier code is divergent (`if (lid < s) tmp[lid] += tmp[lid + s]`), which is supported.
+2. **`__local` memory per work-group.** In SIMT mode up to 12 work-groups run at the same time, so
+   every one needs its own region. VC4C: address `__local` memory relative to a per-work-group base
+   address passed as a UNIFORM, instead of fixed VPM addresses. VC4CL: decide at every launch, like a
+   GPU dispatcher: place the regions in the VPM (about 2–3 KB usable, since user programs can only
+   use the first 4 KB of the VPM because of hardware bug HW-2253, minus VC4C's scratch area) if
+   enough work-groups fit, limiting the number of work-groups running at the same time (occupancy);
+   otherwise in a scratch buffer in RAM, accessed through DMA (the TMU cache isn't coherent with
+   other QPUs' writes). Keep reporting local memory as `CL_GLOBAL`, since the VPM is too small for the
+   advertised sizes.
+3. **Work-groups of 17 to 192 work-items** with barriers: all chunks of a work-group must run at the
+   same time, on several QPUs, synchronizing through the hardware semaphores. The semaphores (16)
+   must be partitioned between the work-groups running at the same time (e.g. 3 semaphores per
+   work-group with a counting barrier), QPUs left over idle. Until then such kernels report
+   `CL_KERNEL_WORK_GROUP_SIZE` 16 in SIMT mode.
+
+### 4. Memory accesses
+
+- **Non-contiguous loads** (`p[idx[gid]]`, `p[2 * gid]`, transposes): the TMU accepts a separate
+  address per lane (VC4C's `customAddressCalculation`). Inactive lanes need a safe address (e.g. the
+  address of an active lane), since TMU requests can't be masked.
+- **Non-contiguous stores:** one single-word DMA per active lane, as the masked store loop already
+  does; faster variants for strided patterns (VDW with a memory stride).
+- **Addresses changing in divergent loops:** use per-lane addresses (above) instead of lane 0's.
+- **8- and 16-bit stores in divergent code**, 64-bit types, private arrays (one stack frame per
+  lane), atomics (serialize the active lanes).
+- **Faster partial stores:** a prefix of active lanes (the end of a bounds check) needs one shorter
+  DMA instead of the lane loop.
+
+### 5. Control flow and work-item functions
+
+- **Computed branches** (`switch` lowered to a jump table) in divergent code: convert to a chain of
+  conditional edges, or handle as a multi-way edge in the region linearization.
+- **Irregular control flow** (regions not laid out between their entry and merge point, loops
+  entered in the middle, overlapping regions): reorder blocks before linearizing, or fall back as
+  today.
+- **2- and 3-dimensional work-groups in SIMT mode:** per-lane local IDs in x, y and z (VC4CL passes
+  the chunk's first local ID; the lane's ID needs to be unflattened). `get_global_linear_id` and
+  `get_local_linear_id` with them.
+
+### 6. Vector kernels
+
+- Divergent control flow (the entry mask per work-item: lanes `w × N … w × N + N − 1`),
+  mixed vector widths in one kernel, real shuffles (rotations within each work-item's lanes),
+  vector parameters (tile them after loading), non-splat vector constants (repeat per work-item),
+  calls to VC4C intrinsics working on vectors (`dot`, `length`, … need the per-work-item layout).
+- Use the QPU's per-quad replication for N = 4 instead of 3 rotations.
+
+### 7. Conformance details
+
+- Device limits: `CL_DEVICE_MAX_WORK_GROUP_SIZE` 192 with lower per-kernel limits is allowed; check
+  `CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE` (16 for SIMT kernels, 16 / N for vector kernels, 1
+  otherwise) and `CL_DEVICE_MAX_WORK_ITEM_SIZES` against the CTS expectations.
+- Inactive lanes read up to 60 bytes past the accessed elements. Harmless on this hardware (RAM, no
+  MMU), but a buffer at the very end of the GPU memory could read beyond it.
+- Long launches: one compute job runs up to about 10,000 chunks and blocks OpenGL meanwhile; a hang
+  takes up to the driver's 10-minute limit to be reset. Consider shorter launches (time-sliced) for
+  interactive systems.
+
+### 8. Performance (not required for conformance)
+
+- Memory latency: issue several TMU loads before waiting for the first (a QPU runs a single
+  thread, so this is the only way to hide DRAM latency).
+- Stores of the 12 QPUs are serialized by the GPU-wide VPM mutex; per-QPU VPM areas would allow
+  concurrent DMA setup.
+- clpeak's global-bandwidth test: report a maximum allocation size of a quarter of the CMA area, so
+  it can allocate its buffers under memory pressure.

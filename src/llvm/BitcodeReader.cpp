@@ -827,6 +827,51 @@ static std::string toComparison(llvm::CmpInst::Predicate pred)
     throw CompilationError(CompilationStep::PARSER, "Unhandled comparison predicate", std::to_string(pred));
 }
 
+/*
+ * Irregular integer types (e.g. i2, which LLVM uses e.g. for the condition of a switch on (v & 3)) are stored in the next
+ * larger regular integer type (see toDataType). Their values are kept zero-extended to their actual width, as e.g. the
+ * case values of a switch are: instructions which can set bits beyond the actual width mask their result, and signed
+ * operations first sign-extend their operands from the actual width.
+ *
+ * Returns the actual width of an irregular integer (or integer vector) type of less than 32 bits, 0 for all other types.
+ */
+static unsigned getIrregularIntegerWidth(const llvm::Type* type)
+{
+    if(type->isVectorTy())
+        type = llvm::cast<const llvm::VectorType>(type)->getElementType();
+    if(!type->isIntegerTy())
+        return 0;
+    auto width = type->getIntegerBitWidth();
+    if(width == 1 || width == 8 || width == 16 || width >= 32)
+        return 0;
+    return width;
+}
+
+// dest = src & ((1 << width) - 1)
+static void insertIrregularIntegerMask(LLVMInstructionList& instructions, const Value& dest, const Value& src,
+    unsigned width, intermediate::InstructionDecorations deco)
+{
+    instructions.emplace_back(std::make_unique<BinaryOperator>(
+        "and", Value(dest), Value(src), Value(Literal((1u << width) - 1u), dest.type)));
+    instructions.back()->setDecorations(deco);
+}
+
+// Returns the value of the irregular integer type with the given width sign-extended to 32 bits
+static Value insertIrregularSignExtension(
+    Method& method, LLVMInstructionList& instructions, const Value& src, unsigned width)
+{
+    // move the sign bit to bit 31 and shift back arithmetically
+    auto type = TYPE_INT32.toVectorType(src.type.getVectorWidth());
+    auto shift = Value(Literal(32u - width), type);
+    auto extended = method.addNewLocal(type, "%irregular_zext");
+    instructions.emplace_back(std::make_unique<UnaryOperator>("zext", Value(extended), Value(src)));
+    auto shifted = method.addNewLocal(type, "%irregular_shl");
+    instructions.emplace_back(std::make_unique<BinaryOperator>("shl", Value(shifted), Value(extended), Value(shift)));
+    auto result = method.addNewLocal(type, "%irregular_sext");
+    instructions.emplace_back(std::make_unique<BinaryOperator>("ashr", Value(result), Value(shifted), Value(shift)));
+    return result;
+}
+
 void BitcodeReader::parseInstruction(
     Module& module, Method& method, LLVMInstructionList& instructions, const llvm::Instruction& inst)
 {
@@ -922,10 +967,42 @@ void BitcodeReader::parseInstruction(
     case BinaryOps::Xor:
     {
         const llvm::BinaryOperator* binOp = llvm::cast<const llvm::BinaryOperator>(&inst);
-        instructions.emplace_back(std::make_unique<BinaryOperator>(binOp->getOpcodeName(),
-            toValue(method, binOp, &instructions), toValue(method, binOp->getOperand(0), &instructions),
-            toValue(method, binOp->getOperand(1), &instructions)));
-        instructions.back()->setDecorations(deco);
+        auto dest = toValue(method, binOp, &instructions);
+        auto arg0 = toValue(method, binOp->getOperand(0), &instructions);
+        auto arg1 = toValue(method, binOp->getOperand(1), &instructions);
+        auto opCode = binOp->getOpcode();
+        auto irregularWidth = getIrregularIntegerWidth(binOp->getType());
+        if(irregularWidth && (opCode == BinaryOps::AShr || opCode == BinaryOps::SDiv || opCode == BinaryOps::SRem))
+        {
+            // signed operations on the sign-extended values (the shift offset is never negative)
+            auto signedArg0 = insertIrregularSignExtension(method, instructions, arg0, irregularWidth);
+            auto signedArg1 = opCode == BinaryOps::AShr ?
+                arg1 :
+                insertIrregularSignExtension(method, instructions, arg1, irregularWidth);
+            auto result = method.addNewLocal(signedArg0.type, "%irregular_result");
+            instructions.emplace_back(
+                std::make_unique<BinaryOperator>(binOp->getOpcodeName(), Value(result), std::move(signedArg0),
+                    std::move(signedArg1)));
+            instructions.back()->setDecorations(deco);
+            insertIrregularIntegerMask(instructions, dest, result, irregularWidth, deco);
+        }
+        else if(irregularWidth &&
+            (opCode == BinaryOps::Add || opCode == BinaryOps::Sub || opCode == BinaryOps::Mul ||
+                opCode == BinaryOps::Shl))
+        {
+            // these may set bits beyond the actual width
+            auto result = method.addNewLocal(dest.type, "%irregular_result");
+            instructions.emplace_back(std::make_unique<BinaryOperator>(
+                binOp->getOpcodeName(), Value(result), std::move(arg0), std::move(arg1)));
+            instructions.back()->setDecorations(deco);
+            insertIrregularIntegerMask(instructions, dest, result, irregularWidth, deco);
+        }
+        else
+        {
+            instructions.emplace_back(std::make_unique<BinaryOperator>(
+                binOp->getOpcodeName(), std::move(dest), std::move(arg0), std::move(arg1)));
+            instructions.back()->setDecorations(deco);
+        }
         break;
     }
     case MemoryOps::Alloca:
@@ -1010,17 +1087,68 @@ void BitcodeReader::parseInstruction(
         FALL_THROUGH
     case CastOps::FPTrunc:
         FALL_THROUGH
-    case CastOps::SExt:
-        FALL_THROUGH
     case CastOps::SIToFP:
-        FALL_THROUGH
-    case CastOps::Trunc:
         FALL_THROUGH
     case CastOps::UIToFP:
     {
         instructions.emplace_back(std::make_unique<UnaryOperator>(inst.getOpcodeName(),
             toValue(method, &inst, &instructions), toValue(method, inst.getOperand(0), &instructions)));
         instructions.back()->setDecorations(deco);
+        break;
+    }
+    case CastOps::Trunc:
+    {
+        auto dest = toValue(method, &inst, &instructions);
+        auto src = toValue(method, inst.getOperand(0), &instructions);
+        if(auto irregularWidth = getIrregularIntegerWidth(inst.getType()))
+        {
+            // truncate to the actual width
+            auto result = method.addNewLocal(dest.type, "%irregular_trunc");
+            instructions.emplace_back(std::make_unique<UnaryOperator>("trunc", Value(result), std::move(src)));
+            instructions.back()->setDecorations(deco);
+            insertIrregularIntegerMask(instructions, dest, result, irregularWidth, deco);
+        }
+        else
+        {
+            instructions.emplace_back(std::make_unique<UnaryOperator>("trunc", std::move(dest), std::move(src)));
+            instructions.back()->setDecorations(deco);
+        }
+        break;
+    }
+    case CastOps::SExt:
+    {
+        auto dest = toValue(method, &inst, &instructions);
+        auto src = toValue(method, inst.getOperand(0), &instructions);
+        auto irregularWidth = getIrregularIntegerWidth(inst.getOperand(0)->getType());
+        if(irregularWidth && dest.type.getScalarBitCount() <= 32)
+        {
+            // sign-extend from the actual width
+            auto extended = insertIrregularSignExtension(method, instructions, src, irregularWidth);
+            if(auto destWidth = getIrregularIntegerWidth(inst.getType()))
+                insertIrregularIntegerMask(instructions, dest, extended, destWidth, deco);
+            else if(dest.type.getScalarBitCount() < 32)
+            {
+                instructions.emplace_back(std::make_unique<UnaryOperator>("trunc", std::move(dest), std::move(extended)));
+                instructions.back()->setDecorations(deco);
+            }
+            else
+            {
+                instructions.emplace_back(std::make_unique<Copy>(std::move(dest), std::move(extended)));
+                instructions.back()->setDecorations(deco);
+            }
+        }
+        else if(irregularWidth)
+        {
+            // 64-bit result
+            auto extended = insertIrregularSignExtension(method, instructions, src, irregularWidth);
+            instructions.emplace_back(std::make_unique<UnaryOperator>("sext", std::move(dest), std::move(extended)));
+            instructions.back()->setDecorations(deco);
+        }
+        else
+        {
+            instructions.emplace_back(std::make_unique<UnaryOperator>("sext", std::move(dest), std::move(src)));
+            instructions.back()->setDecorations(deco);
+        }
         break;
     }
     case CastOps::IntToPtr:
@@ -1126,9 +1254,18 @@ void BitcodeReader::parseInstruction(
     {
         const llvm::CmpInst* comp = llvm::cast<const llvm::CmpInst>(&inst);
         auto compName = toComparison(comp->getPredicate());
-        instructions.emplace_back(std::make_unique<Comparison>(toValue(method, &inst, &instructions),
-            std::move(compName), toValue(method, inst.getOperand(0), &instructions),
-            toValue(method, inst.getOperand(1), &instructions)));
+        auto dest = toValue(method, &inst, &instructions);
+        auto arg0 = toValue(method, inst.getOperand(0), &instructions);
+        auto arg1 = toValue(method, inst.getOperand(1), &instructions);
+        auto irregularWidth = getIrregularIntegerWidth(inst.getOperand(0)->getType());
+        if(irregularWidth && comp->isSigned())
+        {
+            // signed comparison of the sign-extended values
+            arg0 = insertIrregularSignExtension(method, instructions, arg0, irregularWidth);
+            arg1 = insertIrregularSignExtension(method, instructions, arg1, irregularWidth);
+        }
+        instructions.emplace_back(
+            std::make_unique<Comparison>(std::move(dest), std::move(compName), std::move(arg0), std::move(arg1)));
         instructions.back()->setDecorations(deco);
         break;
     }
@@ -1311,8 +1448,9 @@ Value BitcodeReader::toConstant(
             throw CompilationError(CompilationStep::PARSER, "Constant global value is out of valid range",
                 std::to_string(constant->getSExtValue()));
         }
-        if(constant->isNegative())
+        if(constant->isNegative() && !getIrregularIntegerWidth(constant->getType()))
             return Value(toLongLiteral(bit_cast<uint64_t>(constant->getSExtValue())).value(), type);
+        // irregular integer types are kept zero-extended to their actual width, see getIrregularIntegerWidth
         return Value(Literal(static_cast<uint32_t>(constant->getZExtValue())), type);
     }
     /*
@@ -1681,8 +1819,9 @@ CompoundConstant BitcodeReader::toConstantGlobal(Module& module, const llvm::Val
             throw CompilationError(CompilationStep::PARSER, "Constant value is out of valid range",
                 std::to_string(constant->getSExtValue()));
         }
-        if(constant->isNegative())
+        if(constant->isNegative() && !getIrregularIntegerWidth(constant->getType()))
             return CompoundConstant(type, Literal(static_cast<int32_t>(constant->getSExtValue())));
+        // irregular integer types are kept zero-extended to their actual width, see getIrregularIntegerWidth
         return CompoundConstant(type, Literal(static_cast<uint32_t>(constant->getZExtValue())));
     }
     /*
