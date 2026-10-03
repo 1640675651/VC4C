@@ -2494,6 +2494,8 @@ std::vector<MemoryAddress> tools::buildUniforms(Memory& memory, MemoryAddress ba
             qpuUniforms[i++] = config.numGroups[1];
         if(uniformsUsed.getMaxGroupIDZUsed())
             qpuUniforms[i++] = config.numGroups[2];
+        if(uniformsUsed.getNextGroupFlagUsed())
+            qpuUniforms[i++] = 0; // every QPU runs a single work-group
 
         memory.setUniforms(qpuUniforms, baseAddress);
         res.emplace_back(baseAddress);

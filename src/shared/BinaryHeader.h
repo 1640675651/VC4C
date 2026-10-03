@@ -277,6 +277,9 @@ namespace vc4c
         BITFIELD_ENTRY(MaxGroupIDXUsed, bool, 14, Bit)
         BITFIELD_ENTRY(MaxGroupIDYUsed, bool, 15, Bit)
         BITFIELD_ENTRY(MaxGroupIDZUsed, bool, 16, Bit)
+        // SIMT kernels: the UNIFORM after the parameters is non-zero if the QPU runs another work-group, whose
+        // UNIFORMs follow directly
+        BITFIELD_ENTRY(NextGroupFlagUsed, bool, 17, Bit)
 
         size_t countUniforms() const;
     };

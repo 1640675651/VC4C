@@ -4,6 +4,7 @@
  * See the file "LICENSE" for the full license governing this code.
  */
 
+#include "./normalization/SIMT.h"
 #include "./optimization/Optimizer.h"
 #include "Compiler.h"
 #include "Precompiler.h"
@@ -50,6 +51,8 @@ static void printHelp()
     std::map<std::string, std::string> sortedPasses;
     for(const auto& pass : vc4c::optimizations::Optimizer::ALL_PASSES)
         sortedPasses.emplace(pass.parameterName, pass.description);
+    sortedPasses.emplace(vc4c::normalization::SIMT_PASS_NAME,
+        "Runs suitable kernels with one work-item per SIMD lane (default unless VC4C_NO_SIMT is set)");
     for(const auto& pass : sortedPasses)
     {
         std::cout << "\t--f" << std::left << std::setw(28) << pass.first << pass.second << std::endl;

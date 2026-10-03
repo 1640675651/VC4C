@@ -955,10 +955,64 @@ static bool insertSynchronizationBlock(Method& method, BasicBlock& lastBlock)
     return true;
 }
 
+/*
+ * In SIMT mode, every QPU runs whole work-groups independently of the other QPUs. The run-time passes every QPU one
+ * block of UNIFORMs (including the group IDs) per work-group it runs, each followed by a flag whether another block
+ * follows. So the loop simply re-runs the kernel code (which reads the next block) while the flag is set.
+ *
+ * Without this loop, every launch could only run one work-group per QPU.
+ */
+static std::size_t addSIMTWorkGroupLoop(Method& method)
+{
+    CPPLOG_LAZY(logging::Level::DEBUG,
+        log << "Wrapping SIMT kernel " << method.name << " in a work-group loop..." << logging::endl);
+    auto& defaultBlock = *method.begin();
+    if(defaultBlock.empty())
+        return 0u;
+    auto lastBlock = method.findBasicBlock(BasicBlock::LAST_BLOCK);
+    if(!lastBlock)
+    {
+        CPPLOG_LAZY(
+            logging::Level::WARNING, log << "Failed to find the default last block, aborting!" << logging::endl);
+        return 0u;
+    }
+
+    // A new head block, so the loop's back edge does not jump to the start of the kernel
+    auto startIt = method.emplaceLabel(method.walkAllInstructions(),
+        std::make_unique<BranchLabel>(*method.addNewLocal(TYPE_LABEL, "", "%simt_group_loop").local()));
+    startIt->addDecorations(InstructionDecorations::WORK_GROUP_LOOP);
+
+    // The block reading the flag, all returns from the kernel code jump there
+    auto it = method.emplaceLabel(lastBlock->walk(),
+        std::make_unique<BranchLabel>(*method.addNewLocal(TYPE_LABEL, "", "%simt_next_group").local()));
+    it->addDecorations(InstructionDecorations::WORK_GROUP_LOOP);
+    intermediate::redirectAllBranches(*lastBlock, *it.getBasicBlock());
+    it.nextInBlock();
+
+    auto flag = assign(it, TYPE_INT32, "%simt_next_group_flag") = (UNIFORM_REGISTER,
+        InstructionDecorations::WORK_GROUP_UNIFORM_VALUE, InstructionDecorations::IDENTICAL_ELEMENTS);
+    auto cond = assignNop(it) = (as_signed{INT_ZERO} < as_signed{flag}, InstructionDecorations::IDENTICAL_ELEMENTS);
+    auto condValue = method.addNewLocal(TYPE_BOOL);
+    assign(it, condValue) = (BOOL_TRUE, cond, InstructionDecorations::IDENTICAL_ELEMENTS);
+    assign(it, condValue) = (BOOL_FALSE, cond.invert(), InstructionDecorations::IDENTICAL_ELEMENTS);
+    BranchCond branchCond = BRANCH_ALWAYS;
+    std::tie(it, branchCond) = intermediate::insertBranchCondition(method, it, condValue, 1u);
+    auto branch = std::make_unique<intermediate::Branch>(defaultBlock.getLabel()->getLabel(), branchCond);
+    // need to add the work-group-loop decoration before adding the instruction to correctly update the CFG
+    branch->addDecorations(InstructionDecorations::WORK_GROUP_LOOP);
+    it.emplace(std::move(branch));
+
+    method.flags = add_flag(method.flags, MethodFlags::WORK_GROUP_LOOP);
+    method.metaData.uniformsUsed.setNextGroupFlagUsed(true);
+    return 1u;
+}
+
 std::size_t optimizations::addWorkGroupLoop(const Module& module, Method& method, const Configuration& config)
 {
     if(method.walkAllInstructions().isEndOfMethod())
         return 0u;
+    if(method.metaData.mergedWorkItemsFactor > 1)
+        return addSIMTWorkGroupLoop(method);
     CPPLOG_LAZY(
         logging::Level::DEBUG, log << "Wrapping kernel " << method.name << " in a work-group loop..." << logging::endl);
 

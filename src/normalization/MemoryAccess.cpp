@@ -277,7 +277,8 @@ static bool hasOnlyAddressesDerivateOfGroupId(const MemoryAccessRange& range, un
     return false;
 }
 
-static bool mayHaveCrossWorkItemMemoryDependency(const Local* memoryObject, const MemoryInfo& info)
+static bool mayHaveCrossWorkItemMemoryDependency(
+    const Local* memoryObject, const MemoryInfo& info, unsigned workItemMergeFactor)
 {
     // TODO to be precise, we need an alias check here too!
     if(memoryObject && memoryObject->residesInConstantMemory())
@@ -306,10 +307,12 @@ static bool mayHaveCrossWorkItemMemoryDependency(const Local* memoryObject, cons
                [&](const MemoryAccessRange& range) -> bool {
                    return hasOnlyAddressesDerivateOfLocalId(range, minFactor, maxSize);
                }) &&
-            maxSize <= minFactor)
+            maxSize <= minFactor * workItemMergeFactor)
             // If we manged to figure out the dynamic address parts to be (a derivation of) the local or global id, and
             // the maximum accessed vector size is not larger than the minimum accessed local/global id factor, then we
             // don't have data dependencies across different local ids.
+            // With merged work-items (SIMT mode), every QPU accesses the elements of all its work-items at once, but
+            // the ID of its first work-item is a multiple of the merge factor, so the factor applies per QPU.
             return false;
 
         minFactor = std::numeric_limits<unsigned>::max();
@@ -416,8 +419,9 @@ void normalization::mapMemoryAccess(const Module& module, Method& method, const 
         }
     }
 
-    if(std::none_of(infos.begin(), infos.end(), [](const std::pair<const Local*, MemoryInfo>& info) -> bool {
-           return mayHaveCrossWorkItemMemoryDependency(info.first, info.second);
+    if(std::none_of(infos.begin(), infos.end(), [&](const std::pair<const Local*, MemoryInfo>& info) -> bool {
+           return mayHaveCrossWorkItemMemoryDependency(
+               info.first, info.second, std::max(method.metaData.mergedWorkItemsFactor, uint8_t{1}));
        }))
         // We can reason that no work-item (across work-group loops) accesses memory written by another work-item
         // (except maybe the work-item of the previous loop with the same local ID) and thus we can omit the work-group

@@ -9,6 +9,7 @@
 #include "tools.h"
 
 #include "../helper.h"
+#include "../normalization/SIMT.h"
 #include "../optimization/Optimizer.h"
 #include "log.h"
 
@@ -22,6 +23,8 @@ static std::set<std::string> createAvailableOptimizations()
     std::set<std::string> opts;
     for(const auto& op : vc4c::optimizations::Optimizer::ALL_PASSES)
         opts.emplace(op.parameterName);
+    // not an optimization pass, but switched on and off the same way
+    opts.emplace(vc4c::normalization::SIMT_PASS_NAME);
     return opts;
 }
 

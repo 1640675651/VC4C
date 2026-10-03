@@ -21,6 +21,7 @@
 #include "LongOperations.h"
 #include "MemoryAccess.h"
 #include "Rewrite.h"
+#include "SIMT.h"
 
 #include "log.h"
 
@@ -319,6 +320,18 @@ void Normalizer::normalizeMethod(Module& module, Method& method, const std::set<
     std::size_t numInstructions = method.countInstructions();
 
     PROFILE_START(NormalizationPasses);
+
+    // converts the kernel to run one work-item per SIMD lane, if possible. Needs to run before the work-item functions
+    // are intrinsified.
+    if(selectedSteps.empty() || selectedSteps.find("SIMT") != selectedSteps.end())
+    {
+        logging::logLazy(logging::Level::DEBUG, []() {
+            logging::debug() << logging::endl;
+            logging::debug() << "Running pass: SIMT" << logging::endl;
+        });
+        PROFILE_SCOPE(SIMT);
+        vectorizeWorkItems(module, method, config);
+    }
 
     for(const auto& step : initialNormalizationSteps)
     {

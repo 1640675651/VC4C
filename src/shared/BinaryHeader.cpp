@@ -307,6 +307,8 @@ std::string KernelHeader::to_string() const
         uniformsSet.emplace_back("maxGidY");
     if(uniformsUsed.getMaxGroupIDZUsed())
         uniformsSet.emplace_back("maxGidZ");
+    if(uniformsUsed.getNextGroupFlagUsed())
+        uniformsSet.emplace_back("nextGroup");
     const std::string uniformsString =
         uniformsSet.empty() ? "" : (std::string(" (") + ::toString<std::string>(uniformsSet) + ")");
 

@@ -66,7 +66,10 @@ namespace vc4c
         {
             if(auto fixedSize = getFixedWorkGroupSize())
                 return *fixedSize;
-            return NUM_QPUS * std::max(mergedWorkItemsFactor, uint8_t{1});
+            // With merged work-items (SIMT mode), a work-group runs on a single QPU
+            if(mergedWorkItemsFactor > 1)
+                return mergedWorkItemsFactor;
+            return NUM_QPUS;
         }
 
         /**
@@ -75,6 +78,9 @@ namespace vc4c
          */
         inline uint32_t getMaximumInstancesCount() const
         {
+            // With merged work-items (SIMT mode), up to NUM_QPUS work-groups run in parallel, one per QPU
+            if(mergedWorkItemsFactor > 1)
+                return NUM_QPUS;
             auto factor = std::max(mergedWorkItemsFactor, uint8_t{1});
             if(auto fixedSize = getFixedWorkGroupSize())
                 // round up if the fixed number of work-items do not match exactly

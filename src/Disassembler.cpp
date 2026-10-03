@@ -80,6 +80,8 @@ static std::vector<std::string> createUniformValues(const KernelHeader& kernel)
         values.emplace_back("maximum group ID Y");
     if(uniformsUsed.getMaxGroupIDZUsed())
         values.emplace_back("maximum group ID Z");
+    if(uniformsUsed.getNextGroupFlagUsed())
+        values.emplace_back("next work-group flag");
 
     return values;
 }

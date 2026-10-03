@@ -1779,9 +1779,17 @@ NODISCARD static InstructionWalker lowerWriteRAM(
 
     // initialize VPM DMA for writing to host
     Value dmaSetupBits = UNDEFINED_VALUE;
+    auto vectorWidth = cacheEntry.getVectorWidth();
+    auto mergeFactor = method.metaData.mergedWorkItemsFactor;
+    if(mergeFactor > 1 && vectorWidth.hasLiteral(Literal(static_cast<uint32_t>(mergeFactor))))
+    {
+        // SIMT mode: every element is the value of one work-item. With one work-group per QPU, only the first
+        // local_size(0) elements belong to work-items, so only those may be written back.
+        auto localSizes = method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_SIZES)->createReference();
+        vectorWidth = assign(it, TYPE_INT8, "%simt_active_lanes") = (localSizes & Value(Literal(0xFFu), TYPE_INT32));
+    }
     // TODO this assumes 1 row = 1 entry, is this always correct?
-    it = insertWriteDMASetup(
-        it, dmaSetupBits, cacheEntry.area, cacheEntry.getScalarType(), cacheEntry.getVectorWidth(), numEntries);
+    it = insertWriteDMASetup(it, dmaSetupBits, cacheEntry.area, cacheEntry.getScalarType(), vectorWidth, numEntries);
 
     if(cacheEntry.inAreaByteOffset != INT_ZERO)
     {
