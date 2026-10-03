@@ -461,15 +461,16 @@ and on the compiler being correct in both modes (see step 1).
   default case for most values. Now the values of such types are kept zero-extended to their actual
   width (`llvm/BitcodeReader.cpp`): truncations, `add`/`sub`/`mul`/`shl` and constants are masked,
   `ashr`/`sdiv`/`srem`, signed comparisons and `sext` first sign-extend from the actual width.
-- Unexplained: **a kernel argument read wrong by the second program of a process.** A host program
-  building and running the `switch` kernel twice (two contexts one after the other, the second build
-  with `--fno-simt`; both builds produce the same code) gets results computed with the kernel argument
-  `n` = 7 instead of 9 from the second run, in 6 of 200 runs, for all work-items using `n` on all
-  QPUs. Running a single program per process never showed it (100 runs, checked against the host).
-  So one UNIFORM value seems wrong for the whole launch. Candidates: the uniform cache flush before a
-  compute job (`vc4_compute_start` flushes the caches and immediately starts the QPUs; the second
-  program's buffers likely reuse the first one's physical memory), or the CPU's write-combined
-  writes of the UNIFORMs.
+- Fixed: **missing register interferences.** The interference graph (`analysis/InterferenceGraph.cpp`)
+  walks every block backwards from its live-out locals and only added edges when a local became live
+  (at a read). Two locals live at the end of a block because different successors need them, but
+  never read while the other one is live, never interfered: e.g. a kernel argument read in some cases
+  of a `switch` and the switch's result, written before the computed branch. They could get the same
+  register, overwriting the argument. Now a local written while other locals are live interferes with
+  all of them (the classic rule). Since VC4C iterates hash maps keyed by pointers, the allocation order
+  depends on memory addresses, so this showed up only for some compilations (about 3 % of the second
+  compilation in a process for the test kernel). `VC4C_SINGLE_THREADED` (new) runs the compiler's
+  per-kernel stages one kernel at a time, to rule out data races in such cases.
 
 ### 3. Barriers and `__local` memory in SIMT mode
 

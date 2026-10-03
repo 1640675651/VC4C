@@ -100,7 +100,22 @@ std::unique_ptr<InterferenceGraph> InterferenceGraph::createGraph(
             // locals.
 
             for(auto loc : changes.removedLocals)
+            {
+                // The local is written here (its live range starts), while all other live locals are still needed
+                // afterwards, so they need different registers. Without these edges, two locals which are live at the
+                // end of a block (e.g. needed by different successors), but never read while the other one is live,
+                // would not interfere and could be assigned the same register.
+                auto removedIt = liveNodes.find(loc);
+                if(removedIt != liveNodes.end())
+                {
+                    for(auto node : liveNodes)
+                    {
+                        if(node.second != removedIt->second)
+                            removedIt->second->getOrCreateEdge(node.second, InterferenceType::USED_SIMULTANEOUSLY);
+                    }
+                }
                 liveNodes.erase(loc);
+            }
 
             for(auto loc : changes.addedLocals)
             {

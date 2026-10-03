@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <future>
 #include <list>
 #include <mutex>
@@ -53,7 +54,9 @@ namespace vc4c
         static void scheduleAll(const std::string& name, const Container& c, const std::function<void(const T&)>& func,
             logging::Logger* logger = nullptr)
         {
-            ThreadPool pool(name, std::min(static_cast<unsigned>(c.size()), std::thread::hardware_concurrency()));
+            // VC4C_SINGLE_THREADED: process one element after the other, e.g. to rule out data races between kernels
+            unsigned numThreads = std::getenv("VC4C_SINGLE_THREADED") ? 1u : std::thread::hardware_concurrency();
+            ThreadPool pool(name, std::min(static_cast<unsigned>(c.size()), numThreads));
             return pool.scheduleAll(c, func, logger);
         }
 
