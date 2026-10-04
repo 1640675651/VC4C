@@ -94,13 +94,15 @@ static NODISCARD InstructionWalker intrinsifyReadWorkGroupInfo(Method& method, I
 }
 
 static NODISCARD InstructionWalker intrinsifyReadWorkItemInfo(Method& method, InstructionWalker it, const Value& arg,
-    BuiltinLocal::Type local, const InstructionDecorations decoration)
+    BuiltinLocal::Type local, const InstructionDecorations decoration, const Value& outOfRangeValue)
 {
     /*
      * work-item infos (id, size) are stored within a single UNIFORM:
      * high <-> low byte
      * 00 | 3.dim | 2.dim | 1.dim
      * -> res = (UNIFORM >> (dim * 8)) & 0xFF
+     *
+     * Dimensions from 3 on are out of range, for which OpenCL 1.2 (section 6.12.1) requires 1 for sizes and 0 for IDs.
      */
     const Local* itemInfo = method.findOrCreateBuiltin(local);
     if(auto literalDim = (arg.getConstantValue() & &Value::getLiteralValue))
@@ -127,22 +129,22 @@ static NODISCARD InstructionWalker intrinsifyReadWorkItemInfo(Method& method, In
                 .addDecorations(decoration)
                 .addDecorations(InstructionDecorations::DIMENSION_Z);
             break;
-        case 3:
-            it.reset(createWithExtras<MoveOperation>(*it.get(), it->getOutput().value(), itemInfo->createReference()))
-                .setUnpackMode(UNPACK_8D_32)
-                .addDecorations(decoration);
-            break;
         default:
-            it.reset(createWithExtras<MoveOperation>(*it.get(), it->getOutput().value(), INT_ZERO))
+            it.reset(createWithExtras<MoveOperation>(*it.get(), it->getOutput().value(), outOfRangeValue))
                 .addDecorations(decoration);
             break;
         }
         return it;
     }
+    const Value out = it->getOutput().value();
     Value tmp0 = assign(it, TYPE_INT8) = mul24(arg, 8_val);
     Value tmp1 = assign(it, TYPE_INT8) = as_unsigned{itemInfo->createReference()} >> tmp0;
-    it.reset(createWithExtras<Operation>(*it.get(), OP_AND, it->getOutput().value(), tmp1,
-                 Value(Literal(static_cast<uint32_t>(0xFF)), TYPE_INT8)))
+    assign(it, out) = (tmp1 & Value(Literal(static_cast<uint32_t>(0xFF)), TYPE_INT8), decoration);
+    // the shift only uses the lower 5 bits of the offset, so dimensions from 4 on would read another dimension's value
+    assign(it, NOP_REGISTER) = (arg ^ 3_val, SetFlag::SET_FLAGS);
+    assign(it, out) = (outOfRangeValue, COND_ZERO_SET, decoration);
+    assign(it, NOP_REGISTER) = (as_unsigned{arg} >> 2_val, SetFlag::SET_FLAGS);
+    it.reset(createWithExtras<MoveOperation>(*it.get(), out, outOfRangeValue, COND_ZERO_CLEAR))
         .addDecorations(decoration);
     return it;
 }
@@ -169,7 +171,7 @@ static NODISCARD InstructionWalker intrinsifyReadLocalSize(Method& method, Instr
             immediate = Literal(0u);
         if(immediate)
         {
-            if(immediate->unsignedInt() > workGroupSizes.size() || workGroupSizes.at(immediate->unsignedInt()) == 0)
+            if(immediate->unsignedInt() >= workGroupSizes.size() || workGroupSizes.at(immediate->unsignedInt()) == 0)
                 it.reset(std::make_unique<MoveOperation>(it->getOutput().value(), INT_ONE)).addDecorations(decorations);
             else
                 it.reset(std::make_unique<MoveOperation>(it->getOutput().value(),
@@ -179,8 +181,7 @@ static NODISCARD InstructionWalker intrinsifyReadLocalSize(Method& method, Instr
             return it;
         }
     }
-    // TODO needs to have a size of 1 for all higher dimensions (instead of currently implicit 0)
-    return intrinsifyReadWorkItemInfo(method, it, arg, BuiltinLocal::Type::LOCAL_SIZES, decorations);
+    return intrinsifyReadWorkItemInfo(method, it, arg, BuiltinLocal::Type::LOCAL_SIZES, decorations, INT_ONE);
 }
 
 static NODISCARD InstructionWalker intrinsifyReadLocalID(Method& method, InstructionWalker it, const Value& arg)
@@ -196,7 +197,8 @@ static NODISCARD InstructionWalker intrinsifyReadLocalID(Method& method, Instruc
         return it;
     }
     return intrinsifyReadWorkItemInfo(
-        method, it, arg, BuiltinLocal::Type::LOCAL_IDS, BuiltinLocal::getDecorations(BuiltinLocal::Type::LOCAL_IDS));
+        method, it, arg, BuiltinLocal::Type::LOCAL_IDS, BuiltinLocal::getDecorations(BuiltinLocal::Type::LOCAL_IDS),
+        INT_ZERO);
 }
 
 static NODISCARD InstructionWalker intrinsifyReadLocalLinearID(Method& method, InstructionWalker it,
