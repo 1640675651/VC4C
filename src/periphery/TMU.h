@@ -96,7 +96,8 @@ namespace vc4c
          * Every QPU has access to 2 TMUs (TMU_0 and TMU_1) and can queue up to 4 requests to each of the TMUs.
          * The VC4 has 2 TMUs shared by all QPUs on a slice. Nevertheless, querying memory via a TMU does not require a
          * mutex-lock. The TMU memory-lookup is per-element, so element X will return the value from the address  given
-         * by element X, write 0 per element to disable.
+         * by element X. Writing 0 for some elements does not disable them on the hardware, but corrupts the loaded values
+         * (see TMU.cpp#insertCalculateAddressOffsets(...)), so unused elements need to load a valid address.
          */
         struct TMU
         {

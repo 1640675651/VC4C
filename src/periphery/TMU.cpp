@@ -134,12 +134,15 @@ static NODISCARD InstructionWalker insertCalculateAddressOffsets(Method& method,
          * If we have a dynamic active element count, we need to mask off the elements not actually used, since
          * otherwise we might read memory which is not mapped at all.
          *
-         * So we need to set all non-active elements to zero to tell the TMU to not load anything into there.
+         * So the non-active elements load the first element's address, which is mapped and on a TMU cache line
+         * loaded anyway. They must not use address 0: on the hardware, a TMU load with some elements reading address 0
+         * corrupts the loaded values (unlike in the emulator, where it does not load anything). E.g. the OpenCL-CTS
+         * test_basic vstore_private kernel then wrote its results to wrong addresses, corrupting the host's memory.
          *
          * NOTE: This code requires the numElements value to be a splat value!
          */
         auto cond = assignNop(it) = as_signed{ELEMENT_NUMBER_REGISTER} >= as_signed{numElements};
-        assign(it, finalAddresses) = (INT_ZERO, cond);
+        assign(it, finalAddresses) = (replicatedAddress, cond);
     }
 
     assign(it, outputAddress) = finalAddresses;

@@ -855,7 +855,8 @@ NODISCARD static InstructionWalker insertCustomAddressesCalculation(InstructionW
     {
         auto cond = assignNop(it) =
             as_signed{ELEMENT_NUMBER_REGISTER} >= as_signed{Value(Literal(numVectorElements), TYPE_INT8)};
-        assign(it, outputAddress) = (INT_ZERO, cond);
+        // The not accessed elements load the first element's address, see TMU.cpp#insertCalculateAddressOffsets(...)
+        assign(it, outputAddress) = (replicatedAddress, cond);
     }
 
     return it;
