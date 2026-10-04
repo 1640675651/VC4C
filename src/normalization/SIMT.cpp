@@ -1189,6 +1189,23 @@ static void convertToSIMT(Method& method, const Analysis& analysis, uint8_t vect
                     else
                     {
                         mem->setOutput(vectorPtr);
+                        const Value source = mem->getSource();
+                        auto sourceLocal = source.checkLocal();
+                        if(sourceLocal ? !analysis.isVarying(source) && !vectorLocals.count(sourceLocal) :
+                                         source.isAllSame())
+                        {
+                            // a work-group uniform value (e.g. out[id] = sum) is the same for all work-items, but
+                            // might only be set in the first lane. (The varying values are converted to vectors
+                            // later.)
+                            auto replicated =
+                                method.addNewLocal(source.type.toVectorType(SIMT_WIDTH), "%simt_uniform_value");
+                            if(source.isAllSame())
+                                assign(it, replicated) = source;
+                            else
+                                it = insertReplication(it, source, replicated);
+                            mem = it.get<MemoryInstruction>();
+                            mem->setArgument(0, replicated);
+                        }
                         if(isScalarOfVectorKernel)
                         {
                             auto compacted = method.addNewLocal(accessType, "%simt_compacted");

@@ -23,9 +23,9 @@ compute 9.36 GFLOPS (15×), scalar `float` bandwidth 8.9× higher.
 
 In SIMT mode **a QPU runs 16 work-items at a time, one per SIMD lane**:
 
-- a work-group is 1-dimensional and has at most 192 work-items (12 QPUs × 16 lanes);
-- the work-groups are split into *chunks* of 16 work-items (the last chunk of a work-group may be
-  shorter). VC4CL deals all chunks of all work-groups round-robin across the 12 QPUs: QPU *q* runs
+- a work-group has at most 192 work-items (12 QPUs × 16 lanes), in any number of dimensions;
+- the work-groups are split into *chunks* of up to 16 consecutive work-items in x of one row (same
+  local IDs in y and z; the last chunk of a row may be shorter). VC4CL deals all chunks of all work-groups round-robin across the 12 QPUs: QPU *q* runs
   the chunks *q*, *q* + 12, *q* + 24, … one after the other within a single launch (see "Work-group
   loop"). One large work-group uses all QPUs, and many small ones run side by side;
 - SIMT kernels have no barriers or `__local` memory, so it doesn't matter which QPU runs which chunk,
@@ -48,7 +48,7 @@ compiled:
 |---|---|---|
 | `CL_DEVICE_MAX_WORK_GROUP_SIZE` | 192 | 12 |
 | `CL_DEVICE_MAX_WORK_ITEM_SIZES` | 192, 192, 192 | 12, 12, 12 |
-| `CL_KERNEL_WORK_GROUP_SIZE`, SIMT kernels (1-dimensional work-groups) | 192 | (no SIMT kernels) |
+| `CL_KERNEL_WORK_GROUP_SIZE`, SIMT kernels | 192 | (no SIMT kernels) |
 | `CL_KERNEL_WORK_GROUP_SIZE`, other kernels with independent work-items | 192 | 12 |
 | `CL_KERNEL_WORK_GROUP_SIZE`, kernels with barriers or `__local` memory | 12 | 12 |
 
@@ -269,8 +269,8 @@ run, one work-group per QPU and launch.
 - `common.cpp`, `Device.cpp`: SIMT or classic mode (`VC4CL_NO_SIMT`) and the device limits, see
   "Modes and work-group size limits".
 - `Kernel.cpp`: `CL_KERNEL_WORK_GROUP_SIZE`, the local-size checks and the heuristics use 192 for SIMT
-  kernels with the work-group loop (16 without it). Larger or multi-dimensional local sizes are
-  rejected with `CL_INVALID_WORK_GROUP_SIZE`. Without a given local size, VC4CL picks the largest
+  kernels with the work-group loop (16 without it). Larger local sizes are rejected with
+  `CL_INVALID_WORK_GROUP_SIZE`, multi-dimensional ones only for SIMT kernels without the loop. Without a given local size, VC4CL picks the largest
   divisor of the global size up to that limit (OpenCL 1.2 requires the local size to divide the
   global size).
 - `executor.cpp`: for kernels with independent work-items, the chunks (16 work-items in SIMT mode,
@@ -378,14 +378,14 @@ before, so most of these only matter for SIMT kernels.
   non-contiguous accesses** (`p[2 * gid]`, `p[idx[gid]]`, transposes): these kernels fall back too.
   Barrier and `__local` kernels run correctly in the normal mode (tested with a reduction kernel).
 - Kernels whose work-item IDs only come from dimension 0. IDs of dimensions 1 and 2 are uniform
-  within a work-group and allowed, but 2- and 3-dimensional NDRanges haven't been tested yet. Neither
-  have global work offsets.
+  within a chunk and allowed (tested with 2- and 3-dimensional NDRanges, also with global work
+  offsets: OpenCL-CTS `global_work_offsets`).
 
 ### Work-group sizes and OpenCL conformance
 
-- SIMT kernels support only 1-dimensional work-groups, of up to 192 work-items. Multi-dimensional
-  local sizes fail with `CL_INVALID_WORK_GROUP_SIZE`, even though the same kernel would accept them in
-  the normal mode (up to 12). Use `--fno-simt` for such launches.
+- SIMT kernels accept work-groups of any dimensions, up to 192 work-items. A chunk only covers one
+  row in x, so narrow work-groups waste lanes: 18 × 10 runs 10 chunks of 16 and 10 of 2 work-items,
+  4 × 4 uses 4 of 16 lanes.
 - **Kernels with barriers or `__local` memory report `CL_KERNEL_WORK_GROUP_SIZE` 12, below the device
   limit of 192.** OpenCL allows this, but applications which use the device limit as their local size
   without checking the kernel's limit fail with `CL_INVALID_WORK_GROUP_SIZE` for such kernels. Classic
@@ -445,6 +445,12 @@ and on the compiler being correct in both modes (see step 1).
   `compiler`, `api`, `vectors`, `relationals`, `commonfns`, `integer_ops` and `geometrics`; the
   `math_brute_force` and `conversions` suites take hours to days on this GPU. Build only the
   selected test directories, single job (`make -j1`).
+  Status: `test_basic` (current CTS main) passes 58 of 112 subtests in both modes, with 48 skipped
+  (images, 64-bit integers, OpenCL 2.0) and the same 6 failing: `bufferreadwriterect`,
+  `vload_local`, `vstore_local`, `vstore_private` and both `work_item_functions_out_of_range`
+  variants. It found two SIMT bugs, both fixed: a work-group uniform value stored at a per-work-item
+  address (`out[id] = sum`) was written by the first lane only (`constant`), and SIMT kernels rejected
+  multi-dimensional work-groups (`global_work_offsets`).
 - **Check results against independently computed values**, not only SIMT against classic mode:
   both modes share the front-end and most of the backend, so a compiler bug produces the same wrong
   result in both (see the `switch` bug below, which a mode comparison didn't catch).
@@ -514,9 +520,10 @@ Today these kernels run in classic mode, at most 12 work-items per work-group (o
 - **Irregular control flow** (regions not laid out between their entry and merge point, loops
   entered in the middle, overlapping regions): reorder blocks before linearizing, or fall back as
   today.
-- **2- and 3-dimensional work-groups in SIMT mode:** per-lane local IDs in x, y and z (VC4CL passes
-  the chunk's first local ID; the lane's ID needs to be unflattened). `get_global_linear_id` and
-  `get_local_linear_id` with them.
+- **Packing rows of narrow work-groups:** multi-dimensional work-groups work, but a chunk is one row
+  in x, so a local size in x below 16 wastes lanes. Several rows per chunk need per-lane local IDs in
+  x, y and z (VC4CL passes the chunk's first local ID; the lane's ID needs to be unflattened), and
+  so do `get_global_linear_id` and `get_local_linear_id`.
 
 ### 6. Vector kernels
 
