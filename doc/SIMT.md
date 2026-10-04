@@ -67,6 +67,7 @@ instructions exactly.
 | Per-lane conditional write to `vpm` | **Not masked.** All 16 lanes are written, even with condition *never*. Masked lanes receive a stale value: the result of the previous instruction. |
 | Per-lane conditional write to `tmu0_s` (address of a load) | **Not masked.** A request is issued for all 16 lanes. Masked lanes read from undefined addresses and return garbage. |
 | `tmu0_s` write with all lanes masked | Still issues a request for all lanes, so it doesn't hang. All values are garbage. |
+| `tmu0_s` write with some lanes at address 0 | **Does not disable those lanes, and the other lanes' values come back wrong** (inferred: the kernel's stores addressed with them went astray, and loading a valid address instead fixed it). Found with OpenCL-CTS, see "Known bugs" in the roadmap. |
 | VPM-to-memory DMA (VDW) of part of a row | **Works exactly.** Start column and width (`VPMBase` column bits, `Depth`) write only the selected words; memory around them is untouched. |
 | Branches | Condition on "all lanes" or "any lane" (`ifallzc`, `ifanyz`, …). |
 
@@ -87,6 +88,8 @@ How the implementation stays safe with these rules:
   see those words.
 - **Stores.** A store writes the whole VPM row, then DMAs only the first *local size* words of it
   (`Depth` computed at run time from the local-size uniform). Inactive lanes never reach memory.
+- **Never address 0.** Lanes that load nothing useful must still read a valid address, never 0 (see
+  the table). VC4C now uses the first lane's address for them.
 
 ## Implementation
 
@@ -445,12 +448,14 @@ and on the compiler being correct in both modes (see step 1).
   `compiler`, `api`, `vectors`, `relationals`, `commonfns`, `integer_ops` and `geometrics`; the
   `math_brute_force` and `conversions` suites take hours to days on this GPU. Build only the
   selected test directories, single job (`make -j1`).
-  Status: `test_basic` (current CTS main) passes 58 of 112 subtests in both modes, with 48 skipped
-  (images, 64-bit integers, OpenCL 2.0) and the same 6 failing: `bufferreadwriterect`,
-  `vload_local`, `vstore_local`, `vstore_private` and both `work_item_functions_out_of_range`
-  variants. It found two SIMT bugs, both fixed: a work-group uniform value stored at a per-work-item
-  address (`out[id] = sum`) was written by the first lane only (`constant`), and SIMT kernels rejected
-  multi-dimensional work-groups (`global_work_offsets`).
+  Status: `test_basic` (current CTS main) passes all 64 applicable subtests of 112 in both modes,
+  with 48 skipped (images, 64-bit integers, OpenCL 2.0). It found two SIMT bugs: a work-group uniform
+  value stored at a per-work-item address (`out[id] = sum`) was written by the first lane only
+  (`constant`), and SIMT kernels rejected multi-dimensional work-groups (`global_work_offsets`). It
+  also found 6 failures in both modes, all fixed: out-of-range dimensions of `get_local_size()` and
+  `get_local_id()` (both `work_item_functions_out_of_range` variants), VC4CL's rectangular buffer
+  copies (`bufferreadwriterect`), three loop vectorizer bugs (`vload_local`), and TMU loads with lanes
+  at address 0 (`vstore_local`, `vstore_private`, see "Known bugs").
 - **Check results against independently computed values**, not only SIMT against classic mode:
   both modes share the front-end and most of the backend, so a compiler bug produces the same wrong
   result in both (see the `switch` bug below, which a mode comparison didn't catch).
@@ -460,6 +465,27 @@ and on the compiler being correct in both modes (see step 1).
   across the QPUs like VC4CL, untested so far.
 
 ### 2. Known bugs (both modes)
+
+- Fixed: **unused lanes of TMU loads read address 0, which corrupted memory.** VC4C groups loads of
+  neighboring addresses into one TMU load of several lanes (`optimization/Memory.cpp`) and loads with
+  a dynamic element count (`periphery/TMU.cpp`). It set the address of the unused lanes to 0, assuming
+  the TMU skips them; VC4C's emulator does. On the hardware, the values loaded by the used lanes came
+  back wrong (inferred from the A/B test below; the values themselves weren't captured). In OpenCL-CTS `test_basic` `vstore_private` and `vstore_local`, `offsets[tid]` was such
+  a grouped load (two loads of the same address, lanes 2 to 15 at address 0), and the kernel computed
+  the address of its final DMA store from it:
+  - the result of some work-items never arrived (in single launches always for work-item 16, never for
+    0 to 15; with 12 QPUs in about 1 of 10 runs, the vectors of one QPU program);
+  - the misdirected DMA writes went to other RAM: GPU timeouts, and on the Raspberry Pi corrupted page
+    tables, crashed processes and hung systems, also after runs that seemed to pass.
+
+  Now the unused lanes load the first lane's address, which is valid and on a cache line loaded
+  anyway. Verified on the GPU with an A/B test of the same kernel: lost results with address 0, correct
+  with the first lane's address. The CTS kernel that failed in 2 of 20 runs passed 20 of 20, and
+  `vstore_private` and `vstore_local` pass in both modes. Since the emulator can't show this, it was
+  found on the hardware: single work-items launched with a global offset (failing deterministically),
+  kernel variants with one part removed at a time, and `--fno-group-memory` (VC4CL now passes VC4C's
+  `--f…` optimization options from the build options to VC4C). The host-checked harness and the logs
+  (`vs_check.c`, `exp.sh`, `experiments.log`) are in `cts-results/tools/` next to this repository.
 
 - Fixed: **irregular integer types were widened without masking.** LLVM narrows values to types like
   `i2` (e.g. for `switch (v & 3)`), which the front-end extends to `i8`. The truncation masked with
