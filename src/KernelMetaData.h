@@ -83,8 +83,10 @@ namespace vc4c
                 return NUM_QPUS;
             auto factor = std::max(mergedWorkItemsFactor, uint8_t{1});
             if(auto fixedSize = getFixedWorkGroupSize())
-                // round up if the fixed number of work-items do not match exactly
-                return (*fixedSize / factor) + (*fixedSize % factor != 0);
+                // round up if the fixed number of work-items do not match exactly. At most all QPUs run at the same
+                // time: larger work-groups run in chunks (independent work-items) or are rejected by VC4CL when
+                // launched (barriers, __local memory). OpenCL requires such kernels to compile anyway.
+                return std::min(NUM_QPUS, (*fixedSize / factor) + (*fixedSize % factor != 0));
             return NUM_QPUS;
         }
     };

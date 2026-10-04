@@ -228,12 +228,6 @@ KernelHeader qpu_asm::createKernelHeader(
     {
         for(std::size_t i = 0; i < method.metaData.workGroupSizes.size(); ++i)
             kernel.workGroupSize[i] = static_cast<uint16_t>(method.metaData.workGroupSizes[i]);
-        auto maxNumInstances = method.metaData.getMaximumInstancesCount();
-        if(maxNumInstances > NUM_QPUS)
-        {
-            logging::error() << "Required number of instances " << maxNumInstances << " exceeds the limit of "
-                             << NUM_QPUS << logging::endl;
-        }
     }
     {
         uint32_t sizeHint = std::accumulate(method.metaData.workGroupSizeHints.begin(),
