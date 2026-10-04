@@ -75,6 +75,18 @@ static unsigned determineVectorizationFactor(const ControlFlowLoop& loop, Option
             if(it && it->getOutput())
                 // TODO is this check enough?
                 maxTypeWidth = std::max(maxTypeWidth, it->getOutput()->type.getVectorWidth());
+            // the memory accesses are vectorized by multiplying the number of elements of their cache entries, which
+            // can be vectors even if the loaded/stored values are not (e.g. a char2 copied as 16-bit scalar)
+            if(auto access = dynamic_cast<const RAMAccessInstruction*>(it.get()))
+            {
+                if(auto vpmCacheEntry = access->getVPMCacheEntry())
+                    maxTypeWidth = std::max(maxTypeWidth, vpmCacheEntry->getVectorType().getVectorWidth());
+                if(auto tmuCacheEntry = access->getTMUCacheEntry())
+                {
+                    if(auto lit = tmuCacheEntry->numVectorElements.getLiteralValue())
+                        maxTypeWidth = std::max(maxTypeWidth, static_cast<unsigned char>(lit->unsignedInt()));
+                }
+            }
         }
     }
 
@@ -91,6 +103,100 @@ static unsigned determineVectorizationFactor(const ControlFlowLoop& loop, Option
         --factor;
     }
     return factor;
+}
+
+static const intermediate::IntermediateInstruction* getSingleWriterInstruction(const Value& val)
+{
+    auto loc = val.checkLocal();
+    return loc ? dynamic_cast<const intermediate::IntermediateInstruction*>(loc->getSingleWriter()) : nullptr;
+}
+
+static Optional<uint32_t> getLiteralArgument(const Value& val)
+{
+    if(auto lit = (val.getConstantValue() & &Value::getLiteralValue))
+        return lit->unsignedInt();
+    return {};
+}
+
+/*
+ * Vectorizing a loop by N makes a VPM access transfer the N times larger cache entry at the address of the first
+ * iteration, which is only correct if consecutive iterations access consecutive memory. Accepts addresses of the form
+ * base + ((i + c) << log2(size)) (or base + (i + c) * size), with a loop-invariant base, a constant c and the induction
+ * variable i incremented by one per iteration. E.g. the copy loop p[3 * i] = q[3 * i] is not contiguous.
+ */
+static bool isContiguousVPMAccess(const ControlFlowLoop& loop, const intermediate::RAMAccessInstruction& access,
+    const InductionVariable& inductionVariable, uint32_t accessBytes)
+{
+    // the locals holding the iteration's value of the induction variable
+    FastSet<const Local*> iterationValues{inductionVariable.local};
+    auto step = inductionVariable.inductionStep;
+    if(!step || step->op != OP_ADD || !step->getSecondArg())
+        return false;
+    if(getLiteralArgument(*step->getSecondArg()) == 1u && step->getFirstArg().checkLocal())
+        iterationValues.emplace(step->getFirstArg().checkLocal());
+    else if(getLiteralArgument(step->getFirstArg()) == 1u && step->getSecondArg()->checkLocal())
+        iterationValues.emplace(step->getSecondArg()->checkLocal());
+    else
+        return false;
+
+    auto isIterationValue = [&](Value val) -> bool {
+        // follow (unconditional) moves
+        for(unsigned i = 0; i < 4; ++i)
+        {
+            auto loc = val.checkLocal();
+            if(!loc)
+                return false;
+            if(iterationValues.find(loc) != iterationValues.end())
+                return true;
+            auto move = dynamic_cast<const intermediate::MoveOperation*>(getSingleWriterInstruction(val));
+            if(!move || !move->isSimpleMove())
+                return false;
+            val = move->getSource();
+        }
+        return false;
+    };
+    // i or i + c
+    auto isIndex = [&](const Value& val) -> bool {
+        if(isIterationValue(val))
+            return true;
+        auto op = dynamic_cast<const intermediate::Operation*>(getSingleWriterInstruction(val));
+        if(!op || op->op != OP_ADD || !op->getSecondArg() || op->hasConditionalExecution())
+            return false;
+        return (getLiteralArgument(*op->getSecondArg()) && isIterationValue(op->getFirstArg())) ||
+            (getLiteralArgument(op->getFirstArg()) && isIterationValue(*op->getSecondArg()));
+    };
+    // index * size
+    auto isByteOffset = [&](const Value& val) -> bool {
+        if(accessBytes == 1 && isIndex(val))
+            return true;
+        auto op = dynamic_cast<const intermediate::Operation*>(getSingleWriterInstruction(val));
+        if(!op || !op->getSecondArg() || op->hasConditionalExecution())
+            return false;
+        auto factor = getLiteralArgument(*op->getSecondArg());
+        if(op->op == OP_SHL)
+            return factor && *factor < 32 && (1u << *factor) == accessBytes && isIndex(op->getFirstArg());
+        if(op->op == OP_MUL24)
+            return factor && *factor == accessBytes && isIndex(op->getFirstArg());
+        return false;
+    };
+    auto isLoopInvariant = [&](const Value& val) -> bool {
+        auto loc = val.checkLocal();
+        if(!loc)
+            return false;
+        bool written = false;
+        loc->forUsers(LocalUse::Type::WRITER, [&](const LocalUser* user) {
+            auto inst = dynamic_cast<const intermediate::IntermediateInstruction*>(user);
+            if(!inst || loop.findInLoop(inst))
+                written = true;
+        });
+        return !written;
+    };
+
+    auto add = dynamic_cast<const intermediate::Operation*>(getSingleWriterInstruction(access.getMemoryAddress()));
+    if(!add || add->op != OP_ADD || !add->getSecondArg() || add->hasConditionalExecution())
+        return false;
+    return (isLoopInvariant(add->getFirstArg()) && isByteOffset(*add->getSecondArg())) ||
+        (isLoopInvariant(*add->getSecondArg()) && isByteOffset(add->getFirstArg()));
 }
 
 /*
@@ -126,6 +232,17 @@ static int calculateCostsVsBenefits(const ControlFlowLoop& loop, const Induction
                     // access
                     // XXX actually per loop iteration
                     costs += isDynamicIterationCount * (access->getVPMCacheEntry() ? 3 : 2);
+                    if(auto vpmCacheEntry = access->getVPMCacheEntry())
+                    {
+                        if(!isContiguousVPMAccess(loop, *access, inductionVariable,
+                               vpmCacheEntry->getVectorType().getInMemoryWidth()))
+                        {
+                            CPPLOG_LAZY(logging::Level::DEBUG,
+                                log << "Cannot vectorize loop with memory access not contiguous across iterations: "
+                                    << it->to_string() << logging::endl);
+                            return std::numeric_limits<int>::min();
+                        }
+                    }
                     auto& addresses = access->op == MemoryOperation::READ ? readAddresses : writtenAddresses;
                     if(auto loc = access->getMemoryAddress().checkLocal())
                     {
@@ -416,7 +533,7 @@ static void vectorizeInstruction(intermediate::IntermediateInstruction* inst, Me
     FastMap<const intermediate::IntermediateInstruction*, VectorizedAccess>& openInstructions,
     unsigned vectorizationFactor, ControlFlowLoop& loop, uint8_t minVectorWidth,
     const Optional<Value>& dynamicElementCount,
-    FastSet<const intermediate::IntermediateInstruction*>& closedInstructions)
+    FastSet<const intermediate::IntermediateInstruction*>& closedInstructions, FastSet<const void*>& resizedCacheEntries)
 {
     CPPLOG_LAZY(logging::Level::DEBUG, log << "Vectorizing instruction: " << inst->to_string() << logging::endl);
 
@@ -524,7 +641,15 @@ static void vectorizeInstruction(intermediate::IntermediateInstruction* inst, Me
 
     if(auto access = dynamic_cast<RAMAccessInstruction*>(inst))
     {
-        if(auto cacheEntry = access->getTMUCacheEntry())
+        // all accesses of a cache entry (e.g. the load from global memory and the store into local memory of a copy)
+        // are vectorized, but the entry itself only once
+        auto tmuCacheEntry = access->getTMUCacheEntry();
+        if(tmuCacheEntry && !resizedCacheEntries.emplace(tmuCacheEntry.get()).second)
+            tmuCacheEntry = nullptr;
+        auto vpmCacheEntry = access->getVPMCacheEntry();
+        if(vpmCacheEntry && !resizedCacheEntries.emplace(vpmCacheEntry.get()).second)
+            vpmCacheEntry = nullptr;
+        if(auto cacheEntry = tmuCacheEntry)
         {
             // if we load from a TMU address, we need to adapt the setting of valid TMU address elements (vs. zeroing
             // out) to match the new vector width
@@ -569,7 +694,7 @@ static void vectorizeInstruction(intermediate::IntermediateInstruction* inst, Me
                 throw CompilationError(CompilationStep::OPTIMIZER,
                     "Failed to rewrite address calculation for vectorized TMU read", inst->to_string());
         }
-        if(auto cacheEntry = access->getVPMCacheEntry())
+        if(auto cacheEntry = vpmCacheEntry)
         {
             // if we read/write to DMA address via VPM, we need to adapt the element type to be accessed
             if(dynamicElementCount)
@@ -1242,6 +1367,7 @@ static std::size_t vectorize(ControlFlowLoop& loop, const Local* startLocal, Met
         log << "Vectorizing loop '" << loop.to_string() << "' with factor of " << vectorizationFactor
             << (dynamicElementCount ? " and dynamic element count" : "") << "..." << logging::endl);
     FastMap<const intermediate::IntermediateInstruction*, VectorizedAccess> openInstructions;
+    FastSet<const void*> resizedCacheEntries;
 
     const_cast<DataType&>(startLocal->type) = startLocal->type.toVectorType(
         static_cast<unsigned char>(startLocal->type.getVectorWidth() * vectorizationFactor));
@@ -1257,7 +1383,7 @@ static std::size_t vectorize(ControlFlowLoop& loop, const Local* startLocal, Met
         if(auto it = loop.findInLoop(inst))
         {
             vectorizeInstruction(it->get(), method, openInstructions, vectorizationFactor, loop,
-                instIt->second.minVectorWidth, dynamicElementCount, closedInstructions);
+                instIt->second.minVectorWidth, dynamicElementCount, closedInstructions, resizedCacheEntries);
             ++numVectorized;
         }
         else
@@ -1289,7 +1415,7 @@ static std::size_t vectorize(ControlFlowLoop& loop, const Local* startLocal, Met
                     // follow all simple moves to other locals (to find the instruction we really care about)
                     vectorizeInstruction(const_cast<intermediate::IntermediateInstruction*>(inst), method,
                         openInstructions, vectorizationFactor, loop, instIt->second.minVectorWidth, dynamicElementCount,
-                        closedInstructions);
+                        closedInstructions, resizedCacheEntries);
                     ++numVectorized;
                 }
                 else
