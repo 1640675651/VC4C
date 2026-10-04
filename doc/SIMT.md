@@ -456,6 +456,26 @@ and on the compiler being correct in both modes (see step 1).
   `get_local_id()` (both `work_item_functions_out_of_range` variants), VC4CL's rectangular buffer
   copies (`bufferreadwriterect`), three loop vectorizer bugs (`vload_local`), and TMU loads with lanes
   at address 0 (`vstore_local`, `vstore_private`, see "Known bugs").
+  `test_api` passes all 95 applicable subtests of 164 in SIMT mode, with 69 skipped. In classic mode,
+  the 3 `work_group_suggested_local_size` subtests fail, a limitation of the CTS: their "odd sizes"
+  case needs an odd non-prime work-group size (counting 1 as prime) below the device maximum, and
+  there is none below 17 (classic mode reports 12). The first run had 22 failures in classic mode
+  and 20 in SIMT mode, plus a hang in both; all except these 3 are fixed:
+  - VC4C rejected kernels with a `reqd_work_group_size` above 12 work-items at compile time
+    (`null_required_work_group_size`, `kernel_required_group_size`). OpenCL requires them to compile;
+    only launching an unsupported size fails. The number of instances (stack frames, spill areas) is
+    now capped at the number of QPUs.
+  - VC4CL reported image and sampler limits without image support, which must be 0 (8 `min_max_*`
+    subtests), and the whole GPU memory as `CL_DEVICE_LOCAL_MEM_SIZE`, which programs then failed to
+    allocate (`min_max_local_mem_size`; now 32 KB, the full profile minimum).
+  - `CL_KERNEL_LOCAL_MEM_SIZE` didn't include the `__local` arguments (`kernel_local_memory_size`),
+    and a `__local` argument of size 0 returned the wrong error (`local_arg_size_zero`).
+  - Missing argument validation (`negative_*`): command-queue properties (invalid bits, out-of-order
+    execution, which the device doesn't support), context properties (invalid values, duplicate
+    names) and device types.
+  - Events in a wait list were neither checked for validity nor for belonging to the command-queue's
+    context. A user event of another context in the wait list of a marker blocked the queue forever
+    (`negative_enqueue_marker_with_wait_list`).
 - **Check results against independently computed values**, not only SIMT against classic mode:
   both modes share the front-end and most of the backend, so a compiler bug produces the same wrong
   result in both (see the `switch` bug below, which a mode comparison didn't catch).
