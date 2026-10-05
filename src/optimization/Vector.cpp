@@ -2088,6 +2088,29 @@ static SIMDVector toVectorMask(const std::bitset<NATIVE_VECTOR_SIZE>& mask, Cond
     return result;
 }
 
+/*
+ * Whether the flags set by the given instruction are only used by the given conditional instruction, i.e. no other
+ * instruction (or branch) up to the next setting of flags depends on them.
+ */
+static bool isOnlyConsumerOfFlags(InstructionWalker flagsSetter, const IntermediateInstruction* consumer)
+{
+    for(auto it = flagsSetter.copy().nextInBlock(); !it.isEndOfBlock(); it.nextInBlock())
+    {
+        if(!it.has())
+            continue;
+        if(it.get() != consumer && it->hasConditionalExecution())
+            return false;
+        if(auto branch = it.get<Branch>())
+        {
+            if(!branch->isUnconditional())
+                return false;
+        }
+        if(it->doesSetFlag())
+            return true;
+    }
+    return true;
+}
+
 std::size_t optimizations::combineVectorElementCopies(const Module& module, Method& method, const Configuration& config)
 {
     std::size_t numChanges = 0;
@@ -2120,9 +2143,15 @@ std::size_t optimizations::combineVectorElementCopies(const Module& module, Meth
                 if(flagsSetter && (*flagsSetter)->writesRegister(REG_NOP) && staticFlags &&
                     (staticMask = toFlagsSetter(*staticFlags, cond)))
                 {
+                    // The previous setting of flags is removed and the current one rewritten, which is only correct
+                    // if no other instruction depends on either of them (e.g. after CombineSettingSameFlags removed a
+                    // duplicate setting of the same flags for another copy, see OpenCL-CTS test_relationals
+                    // shuffle_copy)
                     if(previousCopy && it->getMoveSource() == previousCopy->source &&
                         it->checkOutputLocal() == previousCopy->destination && cond == previousCopy->copyCondition &&
-                        previousCopy->unpackMode == unpackMode && previousCopy->packMode == packMode)
+                        previousCopy->unpackMode == unpackMode && previousCopy->packMode == packMode &&
+                        isOnlyConsumerOfFlags(previousCopy->staticFlagsSetter, previousCopy->copyInstruction.get()) &&
+                        isOnlyConsumerOfFlags(*flagsSetter, it.get()))
                     {
                         CPPLOG_LAZY(logging::Level::DEBUG,
                             log << "Combining element-wise copies of elements "
