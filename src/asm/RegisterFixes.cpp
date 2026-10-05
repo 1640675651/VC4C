@@ -229,6 +229,44 @@ FixupResult qpu_asm::groupParameters(Method& method, const Configuration& config
     return somethingChanged ? FixupResult::FIXES_APPLIED_RECREATE_GRAPH : FixupResult::NOTHING_FIXED;
 }
 
+static bool readsFlags(const intermediate::IntermediateInstruction& inst)
+{
+    if(auto branch = dynamic_cast<const intermediate::Branch*>(&inst))
+        return !branch->isUnconditional();
+    if(auto combined = dynamic_cast<const intermediate::CombinedOperation*>(&inst))
+        return (combined->getFirstOp() && readsFlags(*combined->getFirstOp())) ||
+            (combined->getSecondOp() && readsFlags(*combined->getSecondOp()));
+    return inst.hasConditionalExecution();
+}
+
+static bool setsFlags(const intermediate::IntermediateInstruction& inst)
+{
+    if(auto combined = dynamic_cast<const intermediate::CombinedOperation*>(&inst))
+        return (combined->getFirstOp() && setsFlags(*combined->getFirstOp())) ||
+            (combined->getSecondOp() && setsFlags(*combined->getSecondOp()));
+    return inst.doesSetFlag();
+}
+
+/*
+ * Returns the first position (to insert before) at or after the given one at which the flags are not live, i.e. are
+ * not read before being set again. Returns an empty value if the flags are live until the end of the block.
+ */
+static Optional<InstructionWalker> findFlagsDeadPosition(InstructionWalker start)
+{
+    auto pos = start.copy();
+    while(true)
+    {
+        auto it = pos.copy();
+        while(!it.isEndOfBlock() && (!it.has() || (!readsFlags(*it.get()) && !setsFlags(*it.get()))))
+            it.nextInBlock();
+        if(it.isEndOfBlock() || !readsFlags(*it.get()))
+            // the flags are set again (or the block ends) before being read
+            return (pos.isEndOfBlock() && pos != start) ? Optional<InstructionWalker>{} : Optional<InstructionWalker>{pos};
+        // the flags are read, so they are live at least until after the reading instruction
+        pos = it.nextInBlock();
+    }
+}
+
 static std::pair<const Local*, uint8_t> reserveGroupSpace(
     Method& method, FastMap<const Local*, std::array<const Local*, NATIVE_VECTOR_SIZE>>& groups, const Local* loc)
 {
@@ -351,6 +389,17 @@ FixupResult qpu_asm::groupScalarLocals(
 
     for(auto& entry : candidateLocals)
     {
+        // The spill code (inserting into the vector element) sets flags, so it must not be inserted where flags set
+        // before are still read afterwards (e.g. as reused by multiple conditional instructions)
+        auto spillPosition = findFlagsDeadPosition(entry.second.copy().nextInBlock());
+        if(!spillPosition)
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not grouping local '" << entry.first->to_string()
+                    << "', since the flags are live until the end of the block" << logging::endl);
+            continue;
+        }
+
         // allocate an element in our spill register
         auto pos = reserveGroupSpace(method, groups, entry.first);
         currentlyGroupedLocals.emplace(entry.first, pos);
@@ -361,7 +410,7 @@ FixupResult qpu_asm::groupScalarLocals(
         // after the local write (or the last read within the writing block), insert the spill code
         // we spill a copy to not force the local to an accumulator (since we do full vector rotation)
         {
-            auto spillIt = entry.second.nextInBlock();
+            auto spillIt = *spillPosition;
             auto tmpValue = assign(spillIt, entry.first->type) = entry.first->createReference();
             spillIt = intermediate::insertVectorInsertion(
                 spillIt, method, pos.first->createReference(), Value(SmallImmediate(pos.second), TYPE_INT8), tmpValue);
@@ -413,10 +462,13 @@ FixupResult qpu_asm::rematerializeConstants(Method& method, const Configuration&
     while(!it.isEndOfMethod())
     {
         // 1. Collect constant loads/calculations which are used exactly once (XXX for simplicity only for now)
+        // The constant needs to be the only write of the local, otherwise moving it past the other (e.g. conditional
+        // per-element) writes would overwrite them.
         auto constantValue = NO_VALUE;
         if(it.has() && it->isConstantInstruction() && it->checkOutputLocal() &&
             (constantValue = it->precalculate().first) &&
             it->checkOutputLocal()->countUsers(LocalUse::Type::READER) == 1 &&
+            it->checkOutputLocal()->countUsers(LocalUse::Type::WRITER) == 1 &&
             // if the local is locally limited, moving it (at most by a few instructions) won't have any big effect
             !it.getBasicBlock()->isLocallyLimited(
                 it, it->checkOutputLocal(), config.additionalOptions.accumulatorThreshold))
