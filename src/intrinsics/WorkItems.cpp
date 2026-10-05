@@ -271,6 +271,37 @@ static NODISCARD InstructionWalker intrinsifyReadLocalLinearID(Method& method, I
     return it;
 }
 
+/*
+ * The exact product of a 32-bit value and a local size (less than 2^8). mul24 only multiplies the lower 24 bits, so
+ * group IDs and numbers of groups of 2^24 or more (e.g. more than 16M work-items with a local size of 1) would be
+ * truncated without the product of the upper 8 bits.
+ */
+static Value insertMultiplicationWithLocalSize(InstructionWalker& it, const Value& value, const Value& localSize,
+    std::string&& name, InstructionDecorations decorations = InstructionDecorations::WORK_GROUP_UNIFORM_VALUE)
+{
+    auto low = assign(it, TYPE_INT32, std::string(name)) = (mul24(value, localSize), decorations);
+    auto high = assign(it, TYPE_INT32, std::string(name)) = (as_unsigned{value} >> 24_val, decorations);
+    high = assign(it, TYPE_INT32, std::string(name)) = (mul24(high, localSize), decorations);
+    high = assign(it, TYPE_INT32, std::string(name)) = (high << 24_val, decorations);
+    return assign(it, TYPE_INT32, std::move(name)) = (low + high, decorations);
+}
+
+/*
+ * The lower 32 bits of the product of two 32-bit values from 24-bit multiplications, as in
+ * Operators.cpp#intrinsifyUnsignedIntegerMultiplication (from mesa's vc4 driver).
+ */
+static Value insertFullMultiplication(InstructionWalker& it, const Value& a, const Value& b, std::string&& name)
+{
+    auto aHi = assign(it, TYPE_INT32, std::string(name)) = as_unsigned{a} >> 24_val;
+    auto bHi = assign(it, TYPE_INT32, std::string(name)) = as_unsigned{b} >> 24_val;
+    auto hiLo = assign(it, TYPE_INT32, std::string(name)) = mul24(aHi, b);
+    auto loHi = assign(it, TYPE_INT32, std::string(name)) = mul24(a, bHi);
+    auto lo = assign(it, TYPE_INT32, std::string(name)) = mul24(a, b);
+    auto hi = assign(it, TYPE_INT32, std::string(name)) = hiLo + loHi;
+    hi = assign(it, TYPE_INT32, std::string(name)) = hi << 24_val;
+    return assign(it, TYPE_INT32, std::move(name)) = lo + hi;
+}
+
 static NODISCARD InstructionWalker intrinsifyReadGlobalID(
     Method& method, InstructionWalker it, const Value& arg, bool includeOffset = true)
 {
@@ -303,8 +334,7 @@ static NODISCARD InstructionWalker intrinsifyReadGlobalID(
     it.emplace(std::make_unique<MoveOperation>(tmpLocalID, NOP_REGISTER));
     it = intrinsifyReadLocalID(method, it, arg);
     it.nextInBlock();
-    auto tmp = assign(it, TYPE_INT32, "%group_global_id") =
-        (mul24(tmpGroupID, tmpLocalSize), InstructionDecorations::WORK_GROUP_UNIFORM_VALUE);
+    auto tmp = insertMultiplicationWithLocalSize(it, tmpGroupID, tmpLocalSize, "%group_global_id");
     if(includeOffset)
         tmp = assign(it, TYPE_INT32, "%group_global_id") =
             (tmpGlobalOffset + tmp, InstructionDecorations::WORK_GROUP_UNIFORM_VALUE);
@@ -334,7 +364,15 @@ static NODISCARD InstructionWalker intrinsifyReadGlobalSize(Method& method, Inst
         add_flag(InstructionDecorations::BUILTIN_NUM_GROUPS, InstructionDecorations::UNSIGNED_RESULT,
             InstructionDecorations::WORK_GROUP_UNIFORM_VALUE));
     it.nextInBlock();
-    it.reset(createWithExtras<Operation>(*it.get(), OP_MUL24, it->getOutput().value(), tmpLocalSize, tmpNumGroups))
+    // global_size(dim) = local_size(dim) * num_groups(dim), where the number of groups can be 2^24 or more
+    auto high = assign(it, TYPE_INT32, "%global_size") =
+        (as_unsigned{tmpNumGroups} >> 24_val, InstructionDecorations::WORK_GROUP_UNIFORM_VALUE);
+    high = assign(it, TYPE_INT32, "%global_size") =
+        (mul24(high, tmpLocalSize), InstructionDecorations::WORK_GROUP_UNIFORM_VALUE);
+    high = assign(it, TYPE_INT32, "%global_size") = (high << 24_val, InstructionDecorations::WORK_GROUP_UNIFORM_VALUE);
+    auto low = assign(it, TYPE_INT32, "%global_size") =
+        (mul24(tmpNumGroups, tmpLocalSize), InstructionDecorations::WORK_GROUP_UNIFORM_VALUE);
+    it.reset(createWithExtras<Operation>(*it.get(), OP_ADD, it->getOutput().value(), low, high))
         .addDecorations(add_flag(it->decoration, InstructionDecorations::BUILTIN_GLOBAL_SIZE,
             InstructionDecorations::UNSIGNED_RESULT, InstructionDecorations::WORK_GROUP_UNIFORM_VALUE))
         .addDecorations(dimension);
@@ -479,10 +517,10 @@ bool intrinsics::intrinsifyWorkItemFunction(Method& method, TypedInstructionWalk
         //                    global_size(0)) + (global_id(0) - global_offset(0))
         //                  = (global_id_no_offset_z * global_size_y + global_id_no_offset_y) * global_size_x +
         //                    global_id_no_offset_x
-        // XXX Is mul24 enough? Is more than 2^23 work-items realistic on VC4?
-        auto tmp = assign(it, TYPE_INT32, "%global_id_scalar") = mul24(globalIdScalarZ, globalSizeY);
+        // The global IDs and sizes can be 2^24 or more, so mul24 would be truncated
+        auto tmp = insertFullMultiplication(it, globalIdScalarZ, globalSizeY, "%global_id_scalar");
         tmp = assign(it, TYPE_INT32, "%global_id_scalar") = tmp + globalIdScalarY;
-        tmp = assign(it, TYPE_INT32, "%global_id_scalar") = mul24(tmp, globalSizeX);
+        tmp = insertFullMultiplication(it, tmp, globalSizeX, "%global_id_scalar");
         it.reset(createWithExtras<Operation>(callSite, OP_ADD, callSite.getOutput().value(), tmp, globalIdScalarX))
             .addDecorations(add_flag(decoration, InstructionDecorations::BUILTIN_GLOBAL_ID,
                 InstructionDecorations::UNSIGNED_RESULT, InstructionDecorations::DIMENSION_SCALAR));
