@@ -267,8 +267,9 @@ static std::string checkUnsupported(const Method& method, uint8_t vectorWidth)
                 return "uses synchronization: " + instr->to_string();
             if(auto call = dynamic_cast<const MethodCall*>(instr.get()))
             {
+                // printf() writes one record per QPU, see LowerPrintf
                 for(const char* unsupported : {"barrier", "atomic", "mutex", "semaphore", "dma", "vpm", "fence", "async",
-                        "prefetch", "linear_id"})
+                        "prefetch", "linear_id", "printf"})
                 {
                     if(call->methodName.find(unsupported) != std::string::npos)
                         return "calls " + call->methodName;

@@ -113,6 +113,21 @@ namespace vc4c
     constexpr unsigned VPM_DEFAULT_SIZE = 4 * 1024;
 
     /*
+     * printf() support: kernels calling printf get an additional (hidden) last parameter of this name, a buffer into
+     * which they write their output records (see normalization/Printf.cpp). The run-time allocates it, and formats and
+     * prints the records after the kernel finished.
+     *
+     * The buffer consists of a 32-bit counter of the bytes of records written, PRINTF_BUFFER_SIZE bytes for the
+     * records and PRINTF_MAX_RECORD_SIZE bytes into which the records not fitting anymore are written (and dropped).
+     * A record consists of 32-bit words: its size in bytes, the address of the global data, the address of the format
+     * string and the arguments (one word per scalar or vector element; integers zero-extended, 64-bit integers as lower
+     * and upper word, floats as float and pointers as their address).
+     */
+    constexpr const char* PRINTF_BUFFER_PARAMETER_NAME = "__vc4cl_printf_buffer";
+    constexpr unsigned PRINTF_BUFFER_SIZE = 16 * 1024;
+    constexpr unsigned PRINTF_MAX_RECORD_SIZE = 1024;
+
+    /*
      * Contains additional options for optimization steps configurable via the command-line interface
      */
     struct OptimizationOptions

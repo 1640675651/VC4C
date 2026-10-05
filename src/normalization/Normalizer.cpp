@@ -20,6 +20,7 @@
 #include "LiteralValues.h"
 #include "LongOperations.h"
 #include "MemoryAccess.h"
+#include "Printf.h"
 #include "Rewrite.h"
 #include "SIMT.h"
 
@@ -200,6 +201,9 @@ void wrapNormalizationStep(Module& module, Method& method, InstructionWalker it,
 const static std::vector<std::pair<std::string, NormalizationStep>> initialNormalizationSteps = {
     // fixes "loading" of OpenCL C work-item functions as SPIR-V built-ins. Needs to run before handling intrinsics
     {"LowerSPIRVBuiltins", spirv::lowerBuiltins},
+    // lowers printf() calls into writing into the printf buffer. Needs to run before handling intrinsics, which cannot
+    // handle the float arguments promoted to double
+    {"LowerPrintf", lowerPrintf},
     // intrinsifies calls to built-ins and unsupported operations
     {"Intrinsics", intrinsics::intrinsify},
     // lowers operations taking or returning 64-bit values
