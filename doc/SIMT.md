@@ -100,7 +100,7 @@ work-item functions are intrinsified. It converts a kernel only if:
 
 - all its locals are scalars of at most 32 bits or pointers (no vector types, no 64-bit values);
 - it uses no barriers, atomics, mutexes, semaphores, async copies/prefetches, `get_global_linear_id`,
-  `__local` memory (parameters or variables) or stack allocations (private arrays);
+  `printf` (which writes one record per QPU), `__local` memory (parameters or variables) or stack allocations (private arrays);
 - every memory access reads or writes a single element; no `memcpy`/`memset`-style accesses;
 - every work-item dependent address has a lane stride equal to the element size (`p[gid + c]`,
   `p[get_local_id(0)]`, …), i.e. the 16 lanes access 16 consecutive elements;
@@ -476,6 +476,16 @@ and on the compiler being correct in both modes (see step 1).
   - Events in a wait list were neither checked for validity nor for belonging to the command-queue's
     context. A user event of another context in the wait list of a marker blocked the queue forever
     (`negative_enqueue_marker_with_wait_list`).
+  `test_printf`: `printf` is now implemented (VC4C `normalization/Printf.cpp` writes records into a
+  hidden buffer parameter, VC4CL `printf.cpp` formats them after the kernel finished). 12 of 22
+  subtests pass in both modes, 7 are skipped (double, half, 64-bit integers). The 3 failing ones
+  (`float`, `vector`, `mixed_format_random`) differ in the last digit for some float literals: the CTS
+  expects an RTZ device to also convert decimal literals rounding toward zero (it parses them with
+  `strtof` in RTZ mode), while clang rounds them to nearest, and ignores `#pragma STDC FENV_ROUND`
+  for SPIR. The formatting itself rounds toward zero, as the device does.
+  `test_relationals` passes all 17 subtests in both modes after the register allocation fixes (see
+  "Known bugs"); `test_commonfns` fails only `mix` and `mixf` (RTZ results against the CTS's absolute
+  error bound).
 - **Check results against independently computed values**, not only SIMT against classic mode:
   both modes share the front-end and most of the backend, so a compiler bug produces the same wrong
   result in both (see the `switch` bug below, which a mode comparison didn't catch).
@@ -523,6 +533,30 @@ and on the compiler being correct in both modes (see step 1).
   depends on memory addresses, so this showed up only for some compilations (about 3 % of the second
   compilation in a process for the test kernel). `VC4C_SINGLE_THREADED` (new) runs the compiler's
   per-kernel stages one kernel at a time, to rule out data races in such cases.
+
+- Fixed: **two register-allocation fixups broke conditionally written values.** When the register
+  allocation fails, VC4C retries after rewriting the code (`asm/RegisterFixes.cpp`). Which fixups run
+  depends on the (nondeterministic) allocation order, so the bugs showed up only for some
+  compilations: in OpenCL-CTS `test_relationals` `shuffle_function_call`, about 10 % of the
+  compilations of one of its kernels returned zeros for some elements, deterministically per binary.
+  The CTS test failed in about 1 of 3 runs, in different cases (`float4 to float2`,
+  `uint4 to uint2`) since every run compiles its kernels anew.
+  - `rematerializeConstants` moves a constant write next to its single reader. It didn't check that
+    the constant is the only write of the local: a vector assembled from a zero initialization and
+    16 conditional per-element writes (the TMU address offsets of a grouped load) got the
+    initialization moved after the element writes, so all lanes loaded the first address. Now only
+    locals with a single write are moved.
+  - `groupScalarLocals` spills locals into the elements of a vector register, inserting each value
+    with a flag-setting element selection. It inserted the spill code right after the write, where
+    the flags could be live: several conditional instructions reusing one flag setter (merged by the
+    optimizer) then used the spill's flags, and elements were zeroed. Now the spill code goes to the
+    first position where the flags are dead, and the local isn't spilled if there is none in the
+    block.
+
+  Found by comparing the binaries of repeated compilations (all different) on the GPU, each run
+  several times against a reference output: a wrong binary fails every time. Verified with 60
+  compilations, all correct (before: 5 of 70 wrong). The harness (`shuffle/shb_check.c`, with
+  `BINARY`, `REF`, `GLOBAL` and `LOCAL`) is in `cts-results/tools/`.
 
 ### 3. Barriers and `__local` memory in SIMT mode
 
