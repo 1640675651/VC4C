@@ -6,6 +6,8 @@
 
 #include "FrontendCompiler.h"
 
+#include "FloatLiterals.h"
+
 #include "../ProcessUtil.h"
 #include "../Profiler.h"
 #include "../helper.h"
@@ -200,10 +202,37 @@ static std::unique_ptr<std::stringstream> createStreamOutput(const Precompilatio
     return std::make_unique<std::stringstream>();
 }
 
-template <typename EmitterTag, SourceType OutputType>
-static void compileOpenCLToLLVMIR0(const OpenCLSource& input, PrecompilationResult<OutputType>& output,
-    const std::string& options, PrecompilationConfig& config, EmitterTag tag = {})
+/*
+ * Returns the source with the float literals rounded toward zero (see FloatLiterals.h), or NULL if no literal changed.
+ * For a source file, its directory is added to the include paths, since the rewritten source is not read from there.
+ */
+static std::unique_ptr<OpenCLSource> roundFloatLiterals(const OpenCLSource& input, std::string& additionalOptions)
 {
+    std::stringstream original;
+    input.inner().readInto(original);
+    std::string rewritten;
+    if(!roundFloatLiteralsTowardZero(original.str(), rewritten))
+        return nullptr;
+    CPPLOG_LAZY(logging::Level::DEBUG,
+        log << "Rounded floating-point literals of " << input.inner().to_string() << " toward zero" << logging::endl);
+    if(auto path = input.getFilePath())
+    {
+        auto pos = path->find_last_of('/');
+        additionalOptions = " -I" + (pos == std::string::npos ? std::string(".") : path->substr(0, pos));
+    }
+    std::istringstream in{rewritten};
+    return std::make_unique<OpenCLSource>(in, input.inner().to_string());
+}
+
+template <typename EmitterTag, SourceType OutputType>
+static void compileOpenCLToLLVMIR0(const OpenCLSource& originalInput, PrecompilationResult<OutputType>& output,
+    const std::string& originalOptions, PrecompilationConfig& config, EmitterTag tag = {})
+{
+    std::string additionalOptions;
+    auto rewrittenInput = roundFloatLiterals(originalInput, additionalOptions);
+    const OpenCLSource& input = rewrittenInput ? *rewrittenInput : originalInput;
+    const std::string options = originalOptions + additionalOptions;
+
     auto clangPath = findToolLocation(CLANG_TOOL).value();
     // in both instances, compile to SPIR to match the "architecture" the PCH was compiled for
     const std::string defaultOptions = "-cc1 -triple spir-unknown-unknown";
