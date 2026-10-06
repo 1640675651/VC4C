@@ -443,7 +443,8 @@ and on the compiler being correct in both modes (see step 1).
 
 ### 1. Verification first
 
-- **Run OpenCL-CTS** (github.com/KhronosGroup/OpenCL-CTS; VC4CL already contains workarounds for
+- **Run OpenCL-CTS** (results of all suites run so far: VC4CL's `CONFORMANCE.md`;
+  github.com/KhronosGroup/OpenCL-CTS; VC4CL already contains workarounds for
   its 1.2 version, `cl12_trunk`) in both modes and compare the pass lists. Start with `basic`,
   `compiler`, `api`, `vectors`, `relationals`, `commonfns`, `integer_ops` and `geometrics`; the
   `math_brute_force` and `conversions` suites take hours to days on this GPU. Build only the
@@ -477,12 +478,14 @@ and on the compiler being correct in both modes (see step 1).
     context. A user event of another context in the wait list of a marker blocked the queue forever
     (`negative_enqueue_marker_with_wait_list`).
   `test_printf`: `printf` is now implemented (VC4C `normalization/Printf.cpp` writes records into a
-  hidden buffer parameter, VC4CL `printf.cpp` formats them after the kernel finished). 12 of 22
-  subtests pass in both modes, 7 are skipped (double, half, 64-bit integers). The 3 failing ones
-  (`float`, `vector`, `mixed_format_random`) differ in the last digit for some float literals: the CTS
-  expects an RTZ device to also convert decimal literals rounding toward zero (it parses them with
-  `strtof` in RTZ mode), while clang rounds them to nearest, and ignores `#pragma STDC FENV_ROUND`
-  for SPIR. The formatting itself rounds toward zero, as the device does.
+  hidden buffer parameter, VC4CL `printf.cpp` formats them after the kernel finished). All 15
+  applicable subtests pass in both modes, 7 are skipped (double, half, 64-bit integers). The CTS
+  expects an RTZ device to round toward zero also when formatting floats (VC4CL does) and when
+  converting float literals (it parses them with `strtof` in RTZ mode). clang rounds literals to
+  nearest and ignores `#pragma STDC FENV_ROUND` for SPIR, so VC4C now rewrites the float literals of
+  the OpenCL C source into the hexadecimal literals of their values rounded toward zero before
+  running clang (`precompilation/FloatLiterals.cpp`), which C99 allows. Before, 3 subtests failed in
+  the last digit of some values.
   `test_relationals` passes all 17 subtests in both modes after the register allocation fixes (see
   "Known bugs"); `test_commonfns` fails only `mix` and `mixf` (RTZ results against the CTS's absolute
   error bound).
