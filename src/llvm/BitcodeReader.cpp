@@ -1173,6 +1173,13 @@ void BitcodeReader::parseInstruction(
     case OtherOps::Call:
     {
         const llvm::CallInst* call = llvm::cast<const llvm::CallInst>(&inst);
+        if(auto callee = call->getCalledFunction())
+        {
+            // only an aliasing hint for the LLVM optimizations (emitted by clang when inlining functions with restrict
+            // pointers), with a metadata operand we can't represent
+            if(callee->getName().startswith("llvm.experimental.noalias.scope.decl"))
+                break;
+        }
         std::vector<Value> args;
 #if LLVM_LIBRARY_VERSION >= 140
         for(unsigned i = 0; i < call->arg_size(); ++i)
