@@ -6,6 +6,8 @@
 
 #include "CodeGenerator.h"
 
+#include <cstdlib>
+
 #include "../InstructionWalker.h"
 #include "../Module.h"
 #include "../Profiler.h"
@@ -116,6 +118,13 @@ const FastAccessList<DecoratedInstruction>& CodeGenerator::generateInstructions(
             if(!hasErrors)
                 // no more errors
                 break;
+        }
+        // for debugging: skips the fixup steps whose names are listed (comma-separated)
+        static const std::string skippedSteps = std::getenv("VC4C_SKIP_FIXUPS") ? std::getenv("VC4C_SKIP_FIXUPS") : "";
+        if(!skippedSteps.empty() && skippedSteps.find(stepIt->name) != std::string::npos)
+        {
+            ++stepIt;
+            continue;
         }
         lastResult = runRegisterFixupStep(*stepIt, method, config, coloredGraph);
         if(lastResult == FixupResult::ALL_FIXED)
