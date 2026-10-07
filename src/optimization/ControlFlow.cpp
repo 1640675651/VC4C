@@ -287,6 +287,10 @@ std::size_t optimizations::moveLoopInvariantCode(const Module& module, Method& m
     // 2. Find loops
     auto dominatorTree = cfg.getDominatorTree();
     auto loops = cfg.findLoops(true, true);
+    // loops entered in the middle have no single preheader to move the code into
+    loops.erase(std::remove_if(loops.begin(), loops.end(),
+                    [](const analysis::ControlFlowLoop& loop) -> bool { return !loop.hasSingleEntry(); }),
+        loops.end());
 
     // 3. Generate inclusion relation of loops as trees
     auto inclusionTree = createLoopInclusionTree(loops);
@@ -1055,6 +1059,16 @@ std::size_t optimizations::addWorkGroupLoop(const Module& module, Method& method
         return 0u;
     if(method.metaData.mergedWorkItemsFactor > 1 || hasIndependentWorkItems(method))
         return addIndependentWorkGroupLoop(method);
+    if(method.metaData.workItemLoopLocalIds)
+    {
+        // XXX Kernels whose QPUs loop over their work-items (see normalization/WorkItemLoops.cpp) computed wrong results
+        // when also looping over the work-groups (seen for CLBlast's Xgemv under high register pressure, cause not found
+        // yet). The run-time launches their work-groups one after the other instead.
+        CPPLOG_LAZY(logging::Level::DEBUG,
+            log << "Not wrapping kernel " << method.name
+                << " in a work-group loop, since it loops over the work-items of its QPUs" << logging::endl);
+        return 0u;
+    }
     CPPLOG_LAZY(
         logging::Level::DEBUG, log << "Wrapping kernel " << method.name << " in a work-group loop..." << logging::endl);
 

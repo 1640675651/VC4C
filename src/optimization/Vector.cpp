@@ -1717,6 +1717,9 @@ std::size_t optimizations::vectorizeLoops(const Module& module, Method& method, 
 
     for(auto& loop : loops)
     {
+        if(!loop.hasSingleEntry())
+            // e.g. entered in the middle, the iteration variable can't be determined safely
+            continue;
         // 3. determine operation on iteration variable and bounds
         auto inductionVariable = extractLoopControl(loop, *dependencyGraph);
         PROFILE_COUNTER_SCOPE(vc4c::profiler::COUNTER_OPTIMIZATION, "Loops found", 1);

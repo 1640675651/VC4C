@@ -614,6 +614,30 @@ Optional<InductionVariable> ControlFlowLoop::checkInductionVariable(
     return extractInductionVariable(local, tailBranch, exitBranch, includeIterationInformation);
 }
 
+bool ControlFlowLoop::hasSingleEntry() const
+{
+    const CFGNode* entry = nullptr;
+    bool singleEntry = true;
+    for(const CFGNode* node : *this)
+    {
+        node->forAllIncomingEdges([&](const CFGNode& predecessor, const CFGEdge&) -> bool {
+            if(find(&predecessor) == end())
+            {
+                if(entry && entry != node)
+                {
+                    singleEntry = false;
+                    return false;
+                }
+                entry = node;
+            }
+            return true;
+        });
+        if(!singleEntry)
+            return false;
+    }
+    return true;
+}
+
 const CFGNode* ControlFlowLoop::getHeader() const
 {
     // According to https://www.cs.princeton.edu/courses/archive/spring03/cs320/notes/loops.pdf, slide 11,

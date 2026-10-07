@@ -230,6 +230,14 @@ namespace vc4c
              */
             const CFGNode* getHeader() const;
 
+            /*
+             * Whether the loop is only entered at a single node (its header), i.e. it is not irreducible. E.g. the
+             * loops of kernels looping over their work-items with barriers in loops are entered in the middle (see
+             * normalization/WorkItemLoops.cpp). Transformations assuming a header dominating the loop (e.g. moving
+             * code into a preheader) can't be applied to other loops.
+             */
+            bool hasSingleEntry() const;
+
             /**
              * Returns this loop's tail, or a nullptr if the tail could not be deduced.
              *

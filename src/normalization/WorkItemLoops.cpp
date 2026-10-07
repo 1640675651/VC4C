@@ -81,45 +81,6 @@ static bool endsKernel(const BasicBlock& block)
 }
 
 /*
- * Whether the block is executed on every path through the kernel and at most once, i.e. the end of the kernel can't
- * be reached without passing it, and it can't be reached again from itself.
- */
-static bool isTopLevel(Method& method, BasicBlock& block)
-{
-    // reachable from itself -> in a loop
-    {
-        std::vector<BasicBlock*> pending = getSuccessors(block);
-        FastSet<BasicBlock*> visited;
-        while(!pending.empty())
-        {
-            auto current = pending.back();
-            pending.pop_back();
-            if(current == &block)
-                return false;
-            if(!visited.emplace(current).second)
-                continue;
-            for(auto next : getSuccessors(*current))
-                pending.push_back(next);
-        }
-    }
-    // the end of the kernel reachable from the start without passing the block -> not on every path
-    std::vector<BasicBlock*> pending{&*method.begin()};
-    FastSet<BasicBlock*> visited{&block};
-    while(!pending.empty())
-    {
-        auto current = pending.back();
-        pending.pop_back();
-        if(!visited.emplace(current).second)
-            continue;
-        if(endsKernel(*current))
-            return false;
-        for(auto next : getSuccessors(*current))
-            pending.push_back(next);
-    }
-    return true;
-}
-
-/*
  * Calls the consumers for the values of the kernel code the instruction reads and for the one it (unconditionally)
  * writes. Memory accesses other than loads have their address as output, which they read.
  */
@@ -141,7 +102,10 @@ static void forReadAndWrittenLocals(const IntermediateInstruction& instr,
     });
     if(auto out = instr.checkOutputLocal())
     {
-        if(isCodeLocal(out) && !instr.hasConditionalExecution())
+        // The (conditional) writes of phi values in the predecessor blocks write the value for the successor taking it,
+        // on the other path it is not read before being written again
+        if(isCodeLocal(out) &&
+            (!instr.hasConditionalExecution() || instr.hasDecoration(InstructionDecorations::PHI_NODE)))
             onWrite(out);
     }
 }
@@ -202,63 +166,43 @@ static FastMap<const BasicBlock*, FastSet<const Local*>> determineLiveIns(Method
 }
 
 /*
- * Determines which values are the same for all work-items of a work-group (conservatively): values written only by
- * unconditional instructions in blocks executed by every work-item, computed from literals, parameters and work-group
- * uniform work-item functions only.
+ * Determines whether a value is the same for all work-items and does not change while the kernel runs: it is written
+ * once, computed only from literals, parameters, work-group uniform work-item functions and other such values. Such
+ * values need not be kept per work-item. E.g. values depending on a loop counter (written several times) do change:
+ * every work-item running a region recomputes them from its own loop counter, overwriting the value of the others.
  */
-class UniformValues
+class InvariantValues
 {
 public:
-    UniformValues(Method& method, const FastSet<const BasicBlock*>& topLevelBlocks) : topLevelBlocks(topLevelBlocks)
-    {
-        for(auto& block : method)
-        {
-            for(const auto& instr : block)
-            {
-                if(instr)
-                    instructionBlocks.emplace(instr.get(), &block);
-            }
-        }
-    }
-
-    bool isUniform(const Value& val)
+    bool isInvariant(const Value& val)
     {
         if(val.getLiteralValue() || val.checkVector())
             return true;
-        // e.g. the element number
         auto loc = val.checkLocal();
         if(!loc)
+            // e.g. registers like the element number
             return false;
         if(loc->is<Parameter>() || loc->is<Global>())
             return true;
-        if(loc->is<BuiltinLocal>() || loc->is<StackAllocation>())
+        if(!isCodeLocal(loc) || loc->countUsers(LocalUse::Type::WRITER) != 1)
             return false;
-        auto it = uniform.find(loc);
-        if(it != uniform.end())
+        auto it = invariant.find(loc);
+        if(it != invariant.end())
             return it->second;
-        // assume varying while checking (loops)
-        uniform[loc] = false;
-        bool result = true;
-        loc->forUsers(LocalUse::Type::WRITER, [&](const LocalUser* writer) {
-            if(result && !isUniformWrite(*writer))
-                result = false;
-        });
-        uniform[loc] = result;
+        // assume not invariant while checking (cycles)
+        invariant[loc] = false;
+        auto writer = loc->getSingleWriter();
+        bool result = writer && isInvariantWrite(*writer);
+        invariant[loc] = result;
         return result;
     }
 
 private:
-    const FastSet<const BasicBlock*>& topLevelBlocks;
-    FastMap<const IntermediateInstruction*, const BasicBlock*> instructionBlocks;
-    FastMap<const Local*, bool> uniform;
+    FastMap<const Local*, bool> invariant;
 
-    bool isUniformWrite(const IntermediateInstruction& writer)
+    bool isInvariantWrite(const IntermediateInstruction& writer)
     {
         if(writer.hasConditionalExecution() || writer.hasSideEffects())
-            return false;
-        auto blockIt = instructionBlocks.find(&writer);
-        if(blockIt == instructionBlocks.end() || topLevelBlocks.find(blockIt->second) == topLevelBlocks.end())
-            // written in a block not executed by all work-items (e.g. depending on the local ID)
             return false;
         if(auto call = dynamic_cast<const MethodCall*>(&writer))
         {
@@ -272,11 +216,11 @@ private:
         }
         else if(!dynamic_cast<const MoveOperation*>(&writer) && !dynamic_cast<const Operation*>(&writer) &&
             !dynamic_cast<const IntrinsicOperation*>(&writer))
-            // e.g. memory accesses
+            // e.g. memory loads
             return false;
         for(const auto& arg : writer.getArguments())
         {
-            if(!isUniform(arg))
+            if(!isInvariant(arg))
                 return false;
         }
         return true;
@@ -369,12 +313,6 @@ static std::string checkKernel(Method& method, std::vector<BarrierInfo>& barrier
             it.erase();
     }
 
-    FastSet<const BasicBlock*> topLevelBlocks;
-    for(auto& block : method)
-    {
-        if(isTopLevel(method, block))
-            topLevelBlocks.emplace(&block);
-    }
     bool hasBarrier = false;
     for(auto& block : method)
     {
@@ -387,7 +325,7 @@ static std::string checkKernel(Method& method, std::vector<BarrierInfo>& barrier
         return "has no barriers";
 
     auto liveIns = determineLiveIns(method);
-    UniformValues uniformValues(method, topLevelBlocks);
+    InvariantValues invariantValues;
     // in the order of the blocks
     for(auto& block : method)
     {
@@ -397,9 +335,8 @@ static std::string checkKernel(Method& method, std::vector<BarrierInfo>& barrier
         BarrierInfo info{&block, {}};
         for(auto loc : liveIns[&block])
         {
-            // A value which is the same for all work-items need not be kept per work-item, unless it is written again
-            // later: then the first work-item's write would change the value read by the other work-items
-            if(loc->countUsers(LocalUse::Type::WRITER) == 1 && uniformValues.isUniform(loc->createReference()))
+            // A value which is the same for all work-items and does not change need not be kept per work-item
+            if(invariantValues.isInvariant(loc->createReference()))
                 continue;
             // e.g. the flags of the barriers, which are replaced. Memory writes read their address operand, which is
             // their "output".
