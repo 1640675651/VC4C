@@ -537,6 +537,21 @@ FixupResult qpu_asm::rematerializeConstants(Method& method, const Configuration&
  *
  * => Prefer spilling locals with smaller rating (lower cost, greater possible gain)
  */
+// Whether the instruction (or the part of a combined instruction) writing the local does so conditionally
+static bool writesConditionally(const intermediate::IntermediateInstruction& inst, const Local* loc)
+{
+    if(auto combined = dynamic_cast<const intermediate::CombinedOperation*>(&inst))
+    {
+        for(auto op : {combined->getFirstOp(), combined->getSecondOp()})
+        {
+            if(op && op->writesLocal(loc) && op->hasConditionalExecution())
+                return true;
+        }
+        return false;
+    }
+    return inst.writesLocal(loc) && inst.hasConditionalExecution();
+}
+
 static float calculateRating(
     const LocalUsage& localUsage, const analysis::LoopInclusionTree& inclusionTree, const ColoredNode& node)
 {
@@ -752,8 +767,10 @@ FixupResult qpu_asm::spillLocals(Method& method, const Configuration& config, Gr
                 auto qpuNum = assign(it, TYPE_INT8, "%spill_qpu_offset") = Value(REG_QPU_NUMBER, TYPE_INT8);
                 auto offset = assign(it, TYPE_INT8, "%spill_qpu_offset") = qpuNum * 64_lit; // 16 elements * 4Byte
                 Value groupValue = UNDEFINED_VALUE;
+                // the VPM can't access pointers and booleans (1 bit), so spill them as 32-bit values
                 auto groupValueType =
-                    (loc->type.getPointerType() ? TYPE_INT32 : loc->type).toVectorType(NATIVE_VECTOR_SIZE);
+                    (loc->type.getPointerType() || loc->type.getScalarBitCount() < 8 ? TYPE_INT32 : loc->type)
+                        .toVectorType(NATIVE_VECTOR_SIZE);
                 if(group.mainAccessUse.readsLocal())
                 {
                     // insert read from VPM before access and replace the local with a temporary
@@ -773,6 +790,10 @@ FixupResult qpu_asm::spillLocals(Method& method, const Configuration& config, Gr
                     // insert write to VPM after access and replace the local with a temporary
                     groupValue = method.addNewLocal(groupValueType, loc->name, "spill_write");
                     auto beforeIt = it.copy().previousInBlock();
+                    if(writesConditionally(*it.get(), loc))
+                        // only some elements are written (e.g. inserting a vector element), the others need to keep the
+                        // spilled value, since the whole temporary is written back
+                        it = method.vpm->insertReadVPM(method, it, groupValue, *spillArea, !mutexAlreadyLocked, offset);
                     it->replaceValue(loc->createReference(), groupValue, LocalUse::Type::WRITER);
                     it.nextInBlock();
                     it = method.vpm->insertWriteVPM(method, it, groupValue, *spillArea, !mutexAlreadyLocked, offset);
