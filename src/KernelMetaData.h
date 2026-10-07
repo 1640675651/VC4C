@@ -17,6 +17,8 @@
 
 namespace vc4c
 {
+    class Local;
+
     /**
      * Container for additional meta-data of kernel-functions
      */
@@ -38,6 +40,12 @@ namespace vc4c
          * The factor with which the work-items are merged, e.g. 16 if 16 work-items are merged into one QPU execution.
          */
         uint8_t mergedWorkItemsFactor;
+        /**
+         * For kernels looping over the work-items of their QPU (see normalization/WorkItemLoops.cpp): the local
+         * holding the (packed) local IDs of the current work-item, which the work-item functions read instead of the
+         * UNIFORM. NULL for other kernels.
+         */
+        const Local* workItemLoopLocalIds = nullptr;
         /**
          * The meta data strings to be stored in the module and used by the run-time for CL_KERNEL_ATTRIBUTES queries.
          */

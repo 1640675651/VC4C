@@ -118,6 +118,9 @@ std::string MetaData::to_string(bool withQuotes) const
     case Type::KERNEL_PRIVATE_MEMORY_SIZE:
         tmp = "private_memory_size(" + std::to_string(getInt()) + ")";
         break;
+    case Type::KERNEL_MAX_WORK_GROUP_SIZE:
+        tmp = "max_work_group_size(" + std::to_string(getInt()) + ")";
+        break;
     }
     return withQuotes ? "\"" + tmp + "\"" : tmp;
 }

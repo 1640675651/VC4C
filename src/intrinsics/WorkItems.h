@@ -35,6 +35,12 @@ namespace vc4c
         /**
          * Intrinsifies the call to the barrier(...) OpenCL C function.
          */
+        /*
+         * Lowers vc4cl_work_item_loop_barrier(index, count): a barrier between the count QPUs running a work-group,
+         * where index is the QPU's index within them (see normalization/WorkItemLoops.cpp).
+         */
+        NODISCARD InstructionWalker intrinsifyWorkItemLoopBarrier(
+            Method& method, TypedInstructionWalker<intermediate::MethodCall> inIt);
         NODISCARD InstructionWalker intrinsifyBarrier(
             Method& method, TypedInstructionWalker<intermediate::MethodCall> it);
 

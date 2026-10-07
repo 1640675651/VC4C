@@ -314,6 +314,10 @@ KernelHeader qpu_asm::createKernelHeader(
         addSingletonMetaData<MetaData::KERNEL_PRIVATE_MEMORY_SIZE>(kernel.metaData, stackSize + privateBufferSize);
     if(localBufferSize > 0)
         addSingletonMetaData<MetaData::KERNEL_LOCAL_MEMORY_SIZE>(kernel.metaData, localBufferSize);
+    if(method.metaData.workItemLoopLocalIds)
+        // the QPUs of a work-group loop over up to one work-item per SIMD lane, see normalization/WorkItemLoops.cpp
+        addSingletonMetaData<MetaData::KERNEL_MAX_WORK_GROUP_SIZE>(
+            kernel.metaData, static_cast<uint32_t>(NUM_QPUS * NATIVE_VECTOR_SIZE));
 
     return kernel;
 }

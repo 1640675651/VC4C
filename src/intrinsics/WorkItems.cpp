@@ -105,6 +105,9 @@ static NODISCARD InstructionWalker intrinsifyReadWorkItemInfo(Method& method, In
      * Dimensions from 3 on are out of range, for which OpenCL 1.2 (section 6.12.1) requires 1 for sizes and 0 for IDs.
      */
     const Local* itemInfo = method.findOrCreateBuiltin(local);
+    if(local == BuiltinLocal::Type::LOCAL_IDS && method.metaData.workItemLoopLocalIds)
+        // the kernel loops over the work-items of its QPU, see normalization/WorkItemLoops.cpp
+        itemInfo = method.metaData.workItemLoopLocalIds;
     if(auto literalDim = (arg.getConstantValue() & &Value::getLiteralValue))
     {
         // NOTE: This forces the local_ids/local_sizes values to be on register-file A, but safes an instruction per
@@ -635,9 +638,49 @@ static void insertPrimaryBarrierCode(Method& method, BasicBlock& block, const Va
     it.emplace(std::make_unique<Branch>(afterLabel));
 }
 
-static void lowerBarrier(Method& method, InstructionWalker it,
-    const std::function<InstructionWalker(InstructionWalker)>& insertFirstWorkItemOnlyCode)
+/*
+ * For kernels looping over the work-items of their QPU (see normalization/WorkItemLoops.cpp): the index of the QPU
+ * within the QPUs running the work-group and their number. The run-time starts QPU i with the local ID of work-item i,
+ * at most min(local size, number of QPUs) QPUs run a work-group.
+ */
+static std::pair<Value, Value> insertWorkItemLoopQPUIndexAndCount(Method& method, InstructionWalker& it)
 {
+    auto ids = method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_IDS)->createReference();
+    auto sizes = method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_SIZES)->createReference();
+    auto byteMask = Value(Literal(0xFFu), TYPE_INT32);
+    auto extractByte = [&](const Value& packed, uint32_t dimension) -> Value {
+        if(dimension == 0)
+            return assign(it, TYPE_INT32, "%work_item_loop_qpu") = packed & byteMask;
+        auto shifted = assign(it, TYPE_INT32, "%work_item_loop_qpu") =
+            as_unsigned{packed} >> Value(Literal(dimension * 8u), TYPE_INT32);
+        return assign(it, TYPE_INT32, "%work_item_loop_qpu") = shifted & byteMask;
+    };
+    auto sizeX = extractByte(sizes, 0);
+    auto sizeY = extractByte(sizes, 1);
+    auto sizeZ = extractByte(sizes, 2);
+    auto sizeXY = assign(it, TYPE_INT32, "%work_item_loop_qpu") = mul24(sizeX, sizeY);
+    auto groupSize = assign(it, TYPE_INT32, "%work_item_loop_qpu") = mul24(sizeXY, sizeZ);
+    auto offsetZ = assign(it, TYPE_INT32, "%work_item_loop_qpu") = mul24(extractByte(ids, 2), sizeXY);
+    auto offsetY = assign(it, TYPE_INT32, "%work_item_loop_qpu") = mul24(extractByte(ids, 1), sizeX);
+    auto tmp = assign(it, TYPE_INT32, "%work_item_loop_qpu") = offsetZ + offsetY;
+    auto index = assign(it, TYPE_INT32, "%work_item_loop_qpu_index") = tmp + extractByte(ids, 0);
+    auto count = assign(it, TYPE_INT32, "%work_item_loop_num_qpus") =
+        min(as_signed{groupSize}, as_signed{Value(Literal(static_cast<uint32_t>(NUM_QPUS)), TYPE_INT32)});
+    return std::make_pair(index, count);
+}
+
+/*
+ * If the explicit index and count are given, they are used instead of the local ID and size of the work-item, e.g. for
+ * kernels looping over the work-items of their QPU, where the QPUs of a work-group synchronize (see
+ * normalization/WorkItemLoops.cpp). Barriers inserted later into such kernels (e.g. at the end of a work-group by the
+ * work-group loop) synchronize the QPUs too.
+ */
+static void lowerBarrier(Method& method, InstructionWalker it,
+    const std::function<InstructionWalker(InstructionWalker)>& insertFirstWorkItemOnlyCode,
+    Optional<std::pair<Value, Value>> explicitIndexAndCount = {})
+{
+    if(!explicitIndexAndCount && method.metaData.workItemLoopLocalIds)
+        explicitIndexAndCount = insertWorkItemLoopQPUIndexAndCount(method, it);
     /*
      * "All work-items in a work-group executing the kernel on a processor must execute this function
      *  before any are allowed to continue execution beyond the barrier."
@@ -667,7 +710,9 @@ static void lowerBarrier(Method& method, InstructionWalker it,
     Optional<Value> localSizeScalar = NO_VALUE;
     auto maximumWorkGroupSize = NUM_QPUS;
 
-    if(auto fixedSize = method.metaData.getFixedWorkGroupSize())
+    if(explicitIndexAndCount)
+        localSizeScalar = explicitIndexAndCount->second;
+    else if(auto fixedSize = method.metaData.getFixedWorkGroupSize())
     {
         if(fixedSize == 1u)
         {
@@ -690,10 +735,15 @@ static void lowerBarrier(Method& method, InstructionWalker it,
     Value localSizeZ = UNDEFINED_VALUE;
 
     auto localIdScalar = method.addNewLocal(TYPE_INT8, "%local_id_scalar");
-    it.emplace(std::make_unique<MethodCall>(
-        Value(localIdScalar), std::string(intrinsics::FUNCTION_NAME_LOCAL_LINEAR_ID), std::vector<Value>{}));
-    it = intrinsifyReadLocalLinearID(method, it, &localSizeX, &localSizeY, &localSizeZ);
-    it.nextInBlock();
+    if(explicitIndexAndCount)
+        assign(it, localIdScalar) = explicitIndexAndCount->first;
+    else
+    {
+        it.emplace(std::make_unique<MethodCall>(
+            Value(localIdScalar), std::string(intrinsics::FUNCTION_NAME_LOCAL_LINEAR_ID), std::vector<Value>{}));
+        it = intrinsifyReadLocalLinearID(method, it, &localSizeX, &localSizeY, &localSizeZ);
+        it.nextInBlock();
+    }
 
     if(!localSizeScalar)
     {
@@ -779,6 +829,20 @@ InstructionWalker intrinsics::intrinsifyBarrier(Method& method, TypedInstruction
     // since we do insert functions that needs intrinsification, we need to go over all of them again
     auto origIt = it.copy().previousInBlock();
     lowerBarrier(method, it, {});
+    return origIt.nextInBlock();
+}
+
+InstructionWalker intrinsics::intrinsifyWorkItemLoopBarrier(
+    Method& method, TypedInstructionWalker<intermediate::MethodCall> inIt)
+{
+    const auto& callSite = *inIt.get();
+    InstructionWalker it = inIt;
+    CPPLOG_LAZY(logging::Level::DEBUG,
+        log << "Intrinsifying barrier between the QPUs of a work-group: " << callSite.to_string() << logging::endl);
+    auto index = callSite.assertArgument(0);
+    auto count = callSite.assertArgument(1);
+    auto origIt = it.copy().previousInBlock();
+    lowerBarrier(method, it, {}, std::make_pair(index, count));
     return origIt.nextInBlock();
 }
 

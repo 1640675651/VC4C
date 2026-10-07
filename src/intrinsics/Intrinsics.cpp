@@ -548,7 +548,8 @@ const static std::map<std::string, Intrinsic, std::greater<std::string>> binaryI
         Intrinsic{intrinsifyBinaryALUInstruction(OP_V8MAX.name, false),
             [](const Value& val0, const Value& val1) { return OP_V8MAX(val0, val1).first.value(); }}},
     {"vc4cl_vstore3", Intrinsic{intrinsifyMemoryAccess(MemoryAccess::WRITE, true)}},
-    {"vc4cl_mul_hi", Intrinsic{intrinsifyIntegerMultiplicationHighPart}}};
+    {"vc4cl_mul_hi", Intrinsic{intrinsifyIntegerMultiplicationHighPart}},
+    {"vc4cl_work_item_loop_barrier", Intrinsic{intrinsifyWorkItemLoopBarrier}}};
 
 const static std::map<std::string, Intrinsic, std::greater<std::string>> ternaryIntrinsicMapping = {
     {"vc4cl_dma_copy", Intrinsic{intrinsifyMemoryAccess(MemoryAccess::COPY, false)}}};

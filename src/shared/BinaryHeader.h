@@ -26,7 +26,8 @@ namespace vc4c
     /**
      * Additional metadata to be stored (e.g. OpenCL C attributes).
      *
-     * NOTE: Metadata must not have any semantic meaning effecting the kernel execution itself!
+     * NOTE: Metadata must not have any semantic meaning effecting the kernel execution itself, except for
+     * KERNEL_MAX_WORK_GROUP_SIZE, which raises the limit of work-items per work-group (see below).
      *
      * Binary layout (64-bit rows, item lengths not to scale):
      *
@@ -42,7 +43,13 @@ namespace vc4c
             KERNEL_WORK_GROUP_SIZE_HINT,
             KERNEL_VECTOR_TYPE_HINT,
             KERNEL_LOCAL_MEMORY_SIZE,
-            KERNEL_PRIVATE_MEMORY_SIZE
+            KERNEL_PRIVATE_MEMORY_SIZE,
+            /*
+             * The maximum number of work-items in a work-group of a kernel which loops over the work-items of its QPU
+             * (see VC4C's normalization/WorkItemLoops.cpp): at most min(local size, number of QPUs) QPUs run a
+             * work-group, each work-item i on the QPU with the index i modulo the number of QPUs.
+             */
+            KERNEL_MAX_WORK_GROUP_SIZE
         };
 
         template <Type T>
@@ -76,12 +83,16 @@ namespace vc4c
         template <Type T>
         void setValue(uint32_t value)
         {
-            static_assert(T == Type::KERNEL_LOCAL_MEMORY_SIZE || T == Type::KERNEL_PRIVATE_MEMORY_SIZE, "");
+            static_assert(T == Type::KERNEL_LOCAL_MEMORY_SIZE || T == Type::KERNEL_PRIVATE_MEMORY_SIZE ||
+                    T == Type::KERNEL_MAX_WORK_GROUP_SIZE,
+                "");
             setInt(T, value);
         }
 
         template <Type T>
-        std::enable_if_t<T == Type::KERNEL_LOCAL_MEMORY_SIZE || T == Type::KERNEL_PRIVATE_MEMORY_SIZE, uint32_t>
+        std::enable_if_t<T == Type::KERNEL_LOCAL_MEMORY_SIZE || T == Type::KERNEL_PRIVATE_MEMORY_SIZE ||
+                T == Type::KERNEL_MAX_WORK_GROUP_SIZE,
+            uint32_t>
         getValue() const
         {
             return getInt();

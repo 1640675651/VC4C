@@ -23,6 +23,7 @@
 #include "Printf.h"
 #include "Rewrite.h"
 #include "SIMT.h"
+#include "WorkItemLoops.h"
 
 #include "log.h"
 
@@ -331,6 +332,18 @@ void Normalizer::normalizeMethod(Module& module, Method& method, const std::set<
         });
         PROFILE_SCOPE(SIMT);
         vectorizeWorkItems(module, method, config);
+    }
+
+    // lets kernels with barriers loop over the work-items of their QPU, for work-groups larger than the number of
+    // QPUs. Needs to run before the work-item functions and barriers are intrinsified.
+    if(selectedSteps.empty() || selectedSteps.find("WorkItemLoops") != selectedSteps.end())
+    {
+        logging::logLazy(logging::Level::DEBUG, []() {
+            logging::debug() << logging::endl;
+            logging::debug() << "Running pass: WorkItemLoops" << logging::endl;
+        });
+        PROFILE_SCOPE(WorkItemLoops);
+        loopWorkItems(module, method, config);
     }
 
     for(const auto& step : initialNormalizationSteps)

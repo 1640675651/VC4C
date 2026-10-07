@@ -37,23 +37,25 @@ In SIMT mode **a QPU runs 16 work-items at a time, one per SIMD lane**:
 ### Modes and work-group size limits
 
 The chunk scheduling works for any kernel whose work-items never interact (no barriers, no `__local`
-memory), also for kernels which don't qualify for SIMT mode: their chunks are a single work-item, in
-any dimension. Only kernels with barriers or `__local` memory still need all work-items of a
-work-group running at the same time, one per QPU, so at most 12 per work-group.
+memory), also for kernels which don't qualify for SIMT mode, in both modes: their chunks are a single
+work-item, in any dimension. Only kernels with barriers or `__local` memory still need all work-items
+of a work-group running at the same time, one per QPU, so at most 12 per work-group.
 
-The device limits must hold for every kernel, so the mode is chosen per process, before anything is
-compiled:
+The limits are the same in both modes, the mode is chosen per process, before anything is compiled:
 
 | | SIMT mode (default) | classic mode (`VC4CL_NO_SIMT=1`) |
 |---|---|---|
-| `CL_DEVICE_MAX_WORK_GROUP_SIZE` | 192 | 12 |
-| `CL_DEVICE_MAX_WORK_ITEM_SIZES` | 192, 192, 192 | 12, 12, 12 |
+| `CL_DEVICE_MAX_WORK_GROUP_SIZE` | 192 | 192 |
+| `CL_DEVICE_MAX_WORK_ITEM_SIZES` | 192, 192, 192 | 192, 192, 192 |
 | `CL_KERNEL_WORK_GROUP_SIZE`, SIMT kernels | 192 | (no SIMT kernels) |
-| `CL_KERNEL_WORK_GROUP_SIZE`, other kernels with independent work-items | 192 | 12 |
-| `CL_KERNEL_WORK_GROUP_SIZE`, kernels with barriers or `__local` memory | 12 | 12 |
+| `CL_KERNEL_WORK_GROUP_SIZE`, other kernels with independent work-items | 192 | 192 |
+| `CL_KERNEL_WORK_GROUP_SIZE`, kernels with barriers or `__local` memory, with work-item loops | 192 | 192 |
+| `CL_KERNEL_WORK_GROUP_SIZE`, other kernels with barriers or `__local` memory | 12 | 12 |
 
 A kernel may report a lower limit than the device, as OpenCL allows. In classic mode, VC4CL compiles
-every kernel with `--fno-simt`.
+every kernel with `--fno-simt`. (Until 2026-10-06, classic mode reported 12 for the device and for all
+kernels.) Kernels with barriers or `__local` memory get work-item loops if supported (see roadmap item
+3), so their QPUs loop over up to 16 work-items each.
 
 ## Hardware behavior relevant for SIMT
 
@@ -389,11 +391,12 @@ before, so most of these only matter for SIMT kernels.
 - SIMT kernels accept work-groups of any dimensions, up to 192 work-items. A chunk only covers one
   row in x, so narrow work-groups waste lanes: 18 × 10 runs 10 chunks of 16 and 10 of 2 work-items,
   4 × 4 uses 4 of 16 lanes.
-- **Kernels with barriers or `__local` memory report `CL_KERNEL_WORK_GROUP_SIZE` 12, below the device
-  limit of 192.** OpenCL allows this, but applications which use the device limit as their local size
-  without checking the kernel's limit fail with `CL_INVALID_WORK_GROUP_SIZE` for such kernels. Classic
-  mode (`VC4CL_NO_SIMT=1`) avoids it, at the cost of SIMT mode. Kernels without barriers or `__local`
-  memory accept 192 in either case, also if they don't qualify for SIMT mode.
+- **Some kernels with barriers or `__local` memory report `CL_KERNEL_WORK_GROUP_SIZE` 12, below the
+  device limit of 192**: those which can't loop over their work-items (barriers in loops or branches,
+  private arrays, too many values kept across a barrier, see roadmap item 3). OpenCL allows this, but
+  applications which use the device limit as their local size without checking the kernel's limit
+  fail with `CL_INVALID_WORK_GROUP_SIZE` for such kernels. Classic mode has the same limits. All other
+  kernels accept 192 in either mode, also if they don't qualify for SIMT mode.
 - Without a given local size, VC4CL picks the largest divisor of the global size up to 192: a global
   size of 100 gives a single work-group of 100 (7 chunks, the last with 4 active lanes).
 
@@ -457,11 +460,12 @@ and on the compiler being correct in both modes (see step 1).
   `get_local_id()` (both `work_item_functions_out_of_range` variants), VC4CL's rectangular buffer
   copies (`bufferreadwriterect`), three loop vectorizer bugs (`vload_local`), and TMU loads with lanes
   at address 0 (`vstore_local`, `vstore_private`, see "Known bugs").
-  `test_api` passes all 95 applicable subtests of 164 in SIMT mode, with 69 skipped. In classic mode,
-  the 3 `work_group_suggested_local_size` subtests fail, a limitation of the CTS: their "odd sizes"
-  case needs an odd non-prime work-group size (counting 1 as prime) below the device maximum, and
-  there is none below 17 (classic mode reports 12). The first run had 22 failures in classic mode
-  and 20 in SIMT mode, plus a hang in both; all except these 3 are fixed:
+  `test_api` passes all 95 applicable subtests of 164 in both modes, with 69 skipped. In classic mode,
+  the 3 `work_group_suggested_local_size` subtests failed while classic mode reported a maximum
+  work-group size of 12: their "odd sizes" case needs an odd non-prime work-group size (counting 1 as
+  prime) below the device maximum, and there is none below 17. They pass since classic mode reports
+  192 (roadmap item 3, step 1). The first run had 22 failures in classic mode and 20 in SIMT mode,
+  plus a hang in both; all are fixed:
   - VC4C rejected kernels with a `reqd_work_group_size` above 12 work-items at compile time
     (`null_required_work_group_size`, `kernel_required_group_size`). OpenCL requires them to compile;
     only launching an unsupported size fails. The number of instances (stack frames, spill areas) is
@@ -561,27 +565,117 @@ and on the compiler being correct in both modes (see step 1).
   compilations, all correct (before: 5 of 70 wrong). The harness (`shuffle/shb_check.c`, with
   `BINARY`, `REF`, `GLOBAL` and `LOCAL`) is in `cts-results/tools/`.
 
-### 3. Barriers and `__local` memory in SIMT mode
+### 3. 192 work-items per work-group for every kernel, in both modes
 
-Today these kernels run in classic mode, at most 12 work-items per work-group (one per QPU).
+Goal: every kernel accepts work-groups of up to 192 work-items, in SIMT and in classic mode, so the
+device limits are the same in both modes and no kernel reports less than the device. Today kernels
+with barriers or `__local` memory accept only 12 (one work-item per QPU, all running at the same
+time), also in SIMT mode, where the device reports 192 (see "Work-group sizes and OpenCL
+conformance"). OpenCL allows a lower per-kernel limit, but applications commonly size their
+work-groups from the device limit or hard-code 64 to 256 work-items (e.g. CLBlast's default
+parameters), and then fail with `CL_INVALID_WORK_GROUP_SIZE`. With the same limits, `VC4CL_NO_SIMT` becomes a pure performance and debugging switch, and both modes
+can be compared with identical launches.
 
-1. **Work-groups of up to 16 work-items (one QPU).** `barrier()` becomes a memory fence: the
-   work-items are lanes of one instruction stream, so only outstanding stores need to finish.
-   Typical barrier code is divergent (`if (lid < s) tmp[lid] += tmp[lid + s]`), which is supported.
-2. **`__local` memory per work-group.** In SIMT mode up to 12 work-groups run at the same time, so
-   every one needs its own region. VC4C: address `__local` memory relative to a per-work-group base
-   address passed as a UNIFORM, instead of fixed VPM addresses. VC4CL: decide at every launch, like a
-   GPU dispatcher: place the regions in the VPM (about 2–3 KB usable, since user programs can only
-   use the first 4 KB of the VPM because of hardware bug HW-2253, minus VC4C's scratch area) if
-   enough work-groups fit, limiting the number of work-groups running at the same time (occupancy);
-   otherwise in a scratch buffer in RAM, accessed through DMA (the TMU cache isn't coherent with
-   other QPUs' writes). Keep reporting local memory as `CL_GLOBAL`, since the VPM is too small for the
-   advertised sizes.
-3. **Work-groups of 17 to 192 work-items** with barriers: all chunks of a work-group must run at the
-   same time, on several QPUs, synchronizing through the hardware semaphores. The semaphores (16)
-   must be partitioned between the work-groups running at the same time (e.g. 3 semaphores per
-   work-group with a counting barrier), QPUs left over idle. Until then such kernels report
-   `CL_KERNEL_WORK_GROUP_SIZE` 16 in SIMT mode.
+Desktop GPUs keep all work-items of a work-group resident at the same time (as warps or wavefronts
+with their own registers in a large register file, up to 256 KB per compute unit) and implement
+barriers in hardware. A QPU runs a single thread with 4 KB of registers and has no barrier other than
+the semaphores between QPUs, so the compiler has to do in software what that hardware does: run the
+work-items of a QPU one after another and switch between them at barriers, as CPU implementations
+(e.g. pocl) do.
+
+**Work-item loops.** For a kernel with barriers, VC4C splits the kernel into regions at the barriers
+and wraps every region in a loop over the work-items assigned to the QPU (in SIMT mode: over the
+chunks of 16 lanes), with the local ID as the loop variable. Between two regions, the QPUs of the
+work-group synchronize through the existing semaphore barrier, once per region instead of once per
+work-item. OpenCL requires all work-items of a work-group to reach the same barriers in the same
+order, so the same region sequence is valid for all of them. 192 work-items on 12 QPUs are 16
+work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
+
+- **Values live across a barrier** are stored per work-item: in registers if they fit (e.g. 16
+  work-items with 3 values each), otherwise in a context buffer in RAM, written and read through DMA
+  at the region boundaries. RAM always has room (192 × the live bytes), so no kernel needs a lower
+  limit; kernels with many such values get slower with large work-groups.
+  `CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE` keeps recommending the efficient sizes.
+- **Private arrays and stack frames** are needed per work-item, i.e. per loop iteration.
+- **Barriers in loops and branches** (e.g. the reduction loop `for (s = …) { …; barrier(…); }`) need
+  regions which span loop boundaries: the loop around the barrier becomes a loop around the region
+  sequence. This is the most complex part.
+- **`__local` memory** stays per work-group. In classic mode one work-group runs at a time, so the
+  existing VPM placement (or the RAM buffer for `__local` arguments) is unchanged. In SIMT mode up to
+  12 work-groups run at the same time, so every one needs its own region: VC4C addresses `__local`
+  memory relative to a per-work-group base address passed as a UNIFORM, instead of fixed VPM
+  addresses. VC4CL decides at every launch, like a GPU dispatcher: it places the regions in the VPM
+  (about 2–3 KB are left after VC4C's scratch area, of the 4 KB user programs can address because of
+  hardware erratum HW-2253) if enough work-groups fit, limiting the number of work-groups running at
+  the same time (occupancy); otherwise in a buffer in RAM, accessed through DMA (the TMU cache isn't
+  coherent with other QPUs' writes). Local memory stays reported as `CL_GLOBAL`, since the VPM is too
+  small for the advertised sizes.
+- **Work-groups of up to 16 work-items in SIMT mode** are a special case: a single chunk on a single
+  QPU, where `barrier()` only has to wait for outstanding stores, since the work-items are lanes of
+  one instruction stream. Typical barrier code is divergent (`if (lid < s) tmp[lid] += tmp[lid + s]`),
+  which is supported.
+
+**Steps:**
+
+1. **Done: classic mode, kernels without barriers or `__local` memory** accept 192 work-items, running
+   the work-group in chunks of one work-item per QPU. VC4CL's chunk scheduling already did this; only
+   the limits changed. Since a kernel can't report more than the device, the classic-mode device
+   limits went to 192 at the same time (earlier than planned in step 5), so classic mode now has the
+   same limits as SIMT mode, including the limit of 12 for kernels with barriers or `__local` memory.
+   The `work_group_suggested_local_size` subtests of `test_api` now pass in classic mode too, and
+   `test_basic` still passes.
+2. **Done: work-item loops for kernels whose barriers are all at the top level** (executed exactly once
+   on every path through the kernel), in both modes (kernels with barriers never use SIMT mode), with
+   the values live across barriers in registers (`normalization/WorkItemLoops.cpp`). VC4C records the
+   new limit (192) in the kernel's metadata (`max_work_group_size`), VC4CL then runs a work-group on
+   `min(local size, 12)` QPUs. Details:
+   - A QPU's work-items `q, q + Q, …` (`Q` QPUs) get their local IDs from a vector computed once per
+     work-group (lane `k` for the `k`-th work-item); the work-item functions read the current
+     work-item's IDs instead of the UNIFORM.
+   - Values kept per work-item: locals live at a barrier (block-level liveness, store addresses count
+     as reads) which may differ between the work-items, i.e. not computed only from literals,
+     parameters and work-group uniform work-item functions in blocks executed by all work-items.
+     Each takes one vector register, the work-item's value in its lane.
+   - All barriers of such kernels synchronize the QPUs, not the work-items, also the barrier the
+     work-group loop inserts at the end of a work-group.
+   - Kernels with `__local` memory, but without barriers, are a single region: the whole kernel
+     loops over the QPU's work-items.
+   - Not yet supported, so these kernels keep the limit of 12: private arrays, values other than scalars of at most 32 bits or pointers kept across a barrier,
+     more than 16 such values, and calls of `async_work_group_copy`, `wait_group_events`,
+     `prefetch` and work-group functions (which insert their own barriers between the work-items).
+   - Cost: about 170 to 300 more instructions per kernel (loop setup, saving and restoring the values
+     at every barrier), and the loop overhead per work-item and region.
+   - Verified with host-checked kernels (one barrier; three barriers with branches and a `return`
+     after the last one) for work-groups of 1 to 192 work-items in 1, 2 and 3 dimensions, in the
+     emulator and on the GPU in both modes.
+   - It found two VC4C bugs affecting other kernels too: `PropagateMoves` inserted a register (e.g.
+     the replication register r5) into an instruction unpacking its input, which only register-file A
+     can do, so the unpack was dropped (`get_local_id(0)` returned all packed IDs); and the NOP
+     replacement of the instruction reordering moved a write of a local above earlier reads of it (for
+     locals written several times, e.g. loop counters). Both are fixed (`optimization/Eliminator.cpp`,
+     `optimization/Reordering.cpp`); the pass also avoids the latter pattern itself.
+   - CTS `test_basic`, `test_api` and `test_atomics` pass as before in both modes.
+3. **Done: barriers in loops and (work-group uniform) branches.** A region starts at the start of the
+   kernel or after a barrier and ends at the next barrier reached or at the end of the kernel, so with
+   a barrier in a loop, the region after it ends at the same barrier again (next iteration) or at a
+   later one. Since barriers are in work-group uniform control flow (required by OpenCL), all
+   work-items of a QPU end a region at the same barrier. Where a barrier (or the end of the kernel)
+   ends several regions, the loop over the work-items continues with the region the QPU is in, kept
+   in a (QPU-uniform) variable. Values written in several places (e.g. loop counters, after phi
+   elimination) are kept per work-item, so every work-item continues with its own copy.
+   - The loop over the work-items enters the user's loop in the middle (irreducible control flow),
+     where VC4C's dominator tree analysis got stuck: it now uses the iterative algorithm by Cooper,
+     Harvey and Kennedy (`analysis/DominatorTree.cpp`), the post-dominator tree is unchanged.
+   - Verified with a tree reduction (barrier in the loop, any work-group size) and barriers in a
+     uniform branch (both outcomes), for work-groups of up to 192 work-items, in the emulator and on
+     the GPU in both modes.
+   - Still missing for every kernel to accept 192: private arrays (one stack frame per work-item),
+     values other than scalars kept across barriers, more than 16 such values (a context buffer in
+     RAM instead of registers), and the work-group functions with their own barriers
+     (`async_work_group_copy`, `wait_group_events`, ...).
+4. **The same in SIMT mode**, with the per-work-group `__local` regions, replacing the classic-mode
+   fallback for kernels with barriers or `__local` memory.
+5. (Done with step 1: the classic-mode device limits are 192.)
 
 ### 4. Memory accesses
 
@@ -618,7 +712,8 @@ Today these kernels run in classic mode, at most 12 work-items per work-group (o
 
 ### 7. Conformance details
 
-- Device limits: `CL_DEVICE_MAX_WORK_GROUP_SIZE` 192 with lower per-kernel limits is allowed; check
+- Device limits: `CL_DEVICE_MAX_WORK_GROUP_SIZE` 192 with lower per-kernel limits is allowed, but the
+  goal is 192 for every kernel in both modes (item 3); check
   `CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE` (16 for SIMT kernels, 16 / N for vector kernels, 1
   otherwise) and `CL_DEVICE_MAX_WORK_ITEM_SIZES` against the CTS expectations.
 - Inactive lanes read up to 60 bytes past the accessed elements. Harmless on this hardware (RAM, no
