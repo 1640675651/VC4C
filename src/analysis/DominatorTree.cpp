@@ -204,34 +204,95 @@ static std::unique_ptr<DominatorTree> createTreeInner(ControlFlowGraph& cfg,
     return tree;
 }
 
-static FastSet<const CFGNode*> getDominatorCandidates(const CFGNode& node)
+/*
+ * The iterative algorithm by Cooper, Harvey and Kennedy ("A Simple, Fast Dominance Algorithm"), which also handles
+ * irreducible control flow (e.g. loops entered in the middle, as created for the work-item loops of kernels with
+ * barriers in loops, see normalization/WorkItemLoops.cpp), where the dominator chain resolution above gets stuck.
+ */
+static std::unique_ptr<DominatorTree> createDominatorTreeIterative(ControlFlowGraph& cfg)
 {
-    // check all incoming edges that are not back edges
-    FastSet<const CFGNode*> possibleDominators;
-    std::size_t numIncomingEdges = 0;
-    node.forAllIncomingEdges([&](const CFGNode& predecessor, const CFGEdge& edge) -> bool {
-        ++numIncomingEdges;
-        if(!edge.data.isBackEdge(predecessor.key))
-            possibleDominators.emplace(&predecessor);
-        return true;
-    });
+    PROFILE_SCOPE(createDominatorTree);
+    auto tree = std::make_unique<DominatorTree>(cfg.getNodes().size());
+    for(const auto& node : cfg.getNodes())
+        tree->getOrCreateNode(&node.second);
 
-    // if there is only exactly 1 incoming edge, this is our dominator, even if we jump back to it at some point
-    if(numIncomingEdges == 1)
-        node.forAllIncomingEdges([&](const CFGNode& predecessor, const CFGEdge& edge) -> bool {
-            possibleDominators.emplace(&predecessor);
-            return true;
-        });
+    // reverse post-order of the nodes reachable from the start
+    const CFGNode* start = &cfg.getStartOfControlFlow();
+    std::vector<const CFGNode*> postOrder;
+    {
+        FastSet<const CFGNode*> visited{start};
+        // node and whether its successors were already pushed
+        std::vector<std::pair<const CFGNode*, bool>> stack{{start, false}};
+        while(!stack.empty())
+        {
+            auto& top = stack.back();
+            if(top.second)
+            {
+                postOrder.push_back(top.first);
+                stack.pop_back();
+                continue;
+            }
+            top.second = true;
+            auto current = top.first;
+            current->forAllOutgoingEdges([&](const CFGNode& successor, const CFGEdge&) -> bool {
+                if(visited.emplace(&successor).second)
+                    stack.emplace_back(&successor, false);
+                return true;
+            });
+        }
+    }
+    FastMap<const CFGNode*, std::size_t> postOrderIndex;
+    for(std::size_t i = 0; i < postOrder.size(); ++i)
+        postOrderIndex.emplace(postOrder[i], i);
 
-    // don't use the node itself as dominator (e.g. for single-block loop)
-    possibleDominators.erase(&node);
+    FastMap<const CFGNode*, const CFGNode*> immediateDominators{{start, start}};
+    auto intersect = [&](const CFGNode* a, const CFGNode* b) -> const CFGNode* {
+        while(a != b)
+        {
+            while(postOrderIndex.at(a) < postOrderIndex.at(b))
+                a = immediateDominators.at(a);
+            while(postOrderIndex.at(b) < postOrderIndex.at(a))
+                b = immediateDominators.at(b);
+        }
+        return a;
+    };
+    bool changed = true;
+    while(changed)
+    {
+        changed = false;
+        for(auto nodeIt = postOrder.rbegin(); nodeIt != postOrder.rend(); ++nodeIt)
+        {
+            auto node = *nodeIt;
+            if(node == start)
+                continue;
+            const CFGNode* newDominator = nullptr;
+            node->forAllIncomingEdges([&](const CFGNode& predecessor, const CFGEdge&) -> bool {
+                if(immediateDominators.find(&predecessor) == immediateDominators.end())
+                    // not processed yet (or not reachable from the start)
+                    return true;
+                newDominator = newDominator ? intersect(&predecessor, newDominator) : &predecessor;
+                return true;
+            });
+            auto it = immediateDominators.find(node);
+            if(newDominator && (it == immediateDominators.end() || it->second != newDominator))
+            {
+                immediateDominators[node] = newDominator;
+                changed = true;
+            }
+        }
+    }
 
-    return possibleDominators;
+    for(const auto& entry : immediateDominators)
+    {
+        if(entry.first != entry.second)
+            tree->assertNode(entry.second).addEdge(&tree->assertNode(entry.first), {});
+    }
+    return tree;
 }
 
 std::unique_ptr<DominatorTree> DominatorTree::createDominatorTree(ControlFlowGraph& cfg)
 {
-    return createTreeInner(cfg, getDominatorCandidates, "dominators");
+    return createDominatorTreeIterative(cfg);
 }
 
 static FastSet<const CFGNode*> getPostdominatorCandidates(const CFGNode& node)

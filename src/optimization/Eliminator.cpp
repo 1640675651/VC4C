@@ -558,7 +558,11 @@ std::size_t optimizations::propagateMoves(const Module& module, Method& method, 
                     break;
 
                 bool replacedThisInstruction = false;
-                if(!skipLiteralReads || !it2->readsLiteral())
+                // only register-file A can be unpacked (and r4 for some modes), so a fixed register like the
+                // replication register (r5) can't be inserted into an instruction unpacking its input, e.g. reading
+                // the byte of a local ID. Locals can still be allocated to register-file A.
+                bool skipUnpackedRead = newValue.checkRegister() && it2->hasUnpackMode();
+                if((!skipLiteralReads || !it2->readsLiteral()) && !skipUnpackedRead)
                 {
                     for(auto arg : it2->getArguments())
                     {

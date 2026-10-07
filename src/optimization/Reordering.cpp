@@ -38,6 +38,9 @@ static NODISCARD InstructionWalker findInstructionNotAccessing(BasicBlock& basic
 {
     std::size_t instructionsLeft = replaceNopThreshold;
     auto it = pos;
+    // the locals read by the instructions in between, which a replacement must not write (e.g. a local written several
+    // times, like a loop counter after its last use in the loop body)
+    FastSet<Value> readValues;
     while(instructionsLeft > 0 && !it.isEndOfBlock())
     {
         if(!it.has())
@@ -49,7 +52,9 @@ static NODISCARD InstructionWalker findInstructionNotAccessing(BasicBlock& basic
         }
         bool validReplacement = true;
         PROFILE_START(checkExcludedValues);
-        if(it->getOutput() && excludedValues.find(it->getOutput().value()) != excludedValues.end())
+        if(it->getOutput() &&
+            (excludedValues.find(it->getOutput().value()) != excludedValues.end() ||
+                readValues.find(it->getOutput().value()) != readValues.end()))
         {
             validReplacement = false;
         }
@@ -116,7 +121,12 @@ static NODISCARD InstructionWalker findInstructionNotAccessing(BasicBlock& basic
         }
 
         // otherwise add all outputs by instructions in between (the NOP and the replacement), since they could be used
-        // as input in the following instructions
+        // as input in the following instructions, and all locals read, which must not be overwritten before
+        for(const Value& arg : it->getArguments())
+        {
+            if(arg.checkLocal())
+                readValues.insert(arg);
+        }
         auto out = NO_VALUE;
         if((out = it->getOutput()) && !out->hasRegister(REG_NOP))
         {
