@@ -17,6 +17,7 @@
 #include "log.h"
 #include "logger.h"
 #include "normalization/Normalizer.h"
+#include "normalization/SIMT.h"
 #include "optimization/Optimizer.h"
 #include "precompilation/FrontendCompiler.h"
 #include "spirv/SPIRVLexer.h"
@@ -207,37 +208,64 @@ std::pair<CompilationData, std::size_t> CompilerInstance::generateCode(const Opt
     return std::make_pair(std::move(result), bytesWritten);
 }
 
+/*
+ * The register allocation of large kernels sometimes fails, depending on the iteration order of hash containers keyed
+ * by pointers, i.e. on the memory layout of the compiler's objects. Then the whole compilation is retried, which
+ * usually succeeds. The last attempt runs without the SIMT conversion, since SIMT kernels need more registers (e.g. a
+ * divergent loop accessing memory lane by lane), so a kernel which always fails in SIMT mode still compiles.
+ */
+static constexpr unsigned MAX_COMPILATION_ATTEMPTS = 3;
+
+static bool isRegisterAllocationError(const CompilationError& error)
+{
+    return std::string(error.what()).find("Label/Register Mapping") != std::string::npos;
+}
+
 std::pair<CompilationData, std::size_t> Compiler::compile(const CompilationData& input, const Configuration& config,
     const std::string& options, const std::string& outputFile)
 {
-    try
+    for(unsigned attempt = 1;; ++attempt)
     {
-        CompilerInstance instance{config};
+        try
+        {
+            Configuration attemptConfig = config;
+            if(attempt == MAX_COMPILATION_ATTEMPTS)
+                attemptConfig.additionalDisabledOptimizations.emplace(normalization::SIMT_PASS_NAME);
+            CompilerInstance instance{attemptConfig};
 
-        // pre-compilation
-        instance.precompileAndParseInput(input, options);
+            // pre-compilation
+            instance.precompileAndParseInput(input, options);
 
-        // compilation
-        instance.normalize();
-        instance.optimize();
-        instance.adjust();
-        auto result = instance.generateCode(outputFile.empty() ? Optional<std::string>{} : outputFile);
+            // compilation
+            instance.normalize();
+            instance.optimize();
+            instance.adjust();
+            auto result = instance.generateCode(outputFile.empty() ? Optional<std::string>{} : outputFile);
 
-        // clean-up
-        std::wcout.flush();
-        std::wcerr.flush();
+            // clean-up
+            std::wcout.flush();
+            std::wcerr.flush();
 
-        CPPLOG_LAZY(logging::Level::DEBUG,
-            log << "Compilation complete: " << result.second << " bytes written" << logging::endl);
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Compilation complete: " << result.second << " bytes written" << logging::endl);
 
-        return result;
-    }
-    catch(const CompilationError& e)
-    {
-        // log exception to log
-        logging::error() << "Compiler threw exception: " << e.what() << logging::endl;
-        // re-throw, so caller gets notified
-        throw;
+            return result;
+        }
+        catch(const CompilationError& e)
+        {
+            if(attempt < MAX_COMPILATION_ATTEMPTS && isRegisterAllocationError(e))
+            {
+                logging::warn() << "Register allocation failed (" << e.what() << "), retrying the compilation (attempt "
+                                << (attempt + 1) << " of " << MAX_COMPILATION_ATTEMPTS
+                                << (attempt + 1 == MAX_COMPILATION_ATTEMPTS ? ", without SIMT mode" : "") << ")"
+                                << logging::endl;
+                continue;
+            }
+            // log exception to log
+            logging::error() << "Compiler threw exception: " << e.what() << logging::endl;
+            // re-throw, so caller gets notified
+            throw;
+        }
     }
 }
 
