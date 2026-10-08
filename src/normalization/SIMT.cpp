@@ -1048,6 +1048,67 @@ static bool isElementAccessRotation(const MoveOperation& rotation)
     return supported;
 }
 
+/*
+ * Computes the per-lane addresses of a work-item dependent pointer as a vector of 16 addresses. The pointers themselves
+ * stay scalars in SIMT mode (holding the per-lane addresses), but the code generation may treat scalars as the same in
+ * all lanes, e.g. the register allocation fix-ups grouping scalars into the lanes of a register and replicating them
+ * again. Supported are pointers computed by adding and subtracting offsets and by moves. If an instruction walker is
+ * given, the calculation is inserted before it, else only checked. Returns an empty value if not supported.
+ */
+static Optional<Value> insertAddressVector(
+    Method* method, InstructionWalker* it, const Analysis& analysis, const Value& address, unsigned depth = 0)
+{
+    if(!analysis.isVarying(address))
+        // the same in all lanes, combined with the vectors of offsets by the calculation
+        return address;
+    auto loc = address.checkLocal();
+    auto writer = loc ? loc->getSingleWriter() : nullptr;
+    if(depth > 16 || !writer || writer->hasConditionalExecution() || writer->hasUnpackMode() || writer->hasPackMode())
+        return {};
+    if(auto move = dynamic_cast<const MoveOperation*>(writer))
+    {
+        if(move->getVectorRotation())
+            return {};
+        return insertAddressVector(method, it, analysis, move->getSource(), depth + 1);
+    }
+    auto op = dynamic_cast<const Operation*>(writer);
+    if(!op || (op->op != OP_ADD && op->op != OP_SUB) || !op->getArgument(1))
+        return {};
+    // pointer operands are calculated recursively, the work-item dependent offsets become vectors with the conversion
+    auto resolve = [&](const Value& arg) -> Optional<Value> {
+        return arg.type.getPointerType() ? insertAddressVector(method, it, analysis, arg, depth + 1) : Optional<Value>{arg};
+    };
+    auto arg0 = resolve(op->assertArgument(0));
+    auto arg1 = resolve(op->assertArgument(1));
+    if(!arg0 || !arg1)
+        return {};
+    if(!method || !it)
+        return address;
+    auto result = method->addNewLocal(TYPE_INT32.toVectorType(SIMT_WIDTH), "%simt_lane_addresses");
+    it->emplace(std::make_unique<Operation>(op->op, Value(result), Value(*arg0), Value(*arg1)));
+    it->nextInBlock();
+    return result;
+}
+
+/*
+ * Whether the work-items access their 32-bit elements at addresses which are not consecutive across the lanes (e.g.
+ * transposed or strided accesses, or computed indices). Such accesses are run lane by lane, see insertScatteredAccess.
+ */
+static bool isScatteredAccess(const Analysis& analysis, const MemoryInstruction& mem, uint8_t vectorWidth)
+{
+    if(vectorWidth > 1 || (mem.op != MemoryOperation::READ && mem.op != MemoryOperation::WRITE))
+        return false;
+    bool isRead = mem.op == MemoryOperation::READ;
+    const Value& address = isRead ? mem.getSource() : mem.getDestination();
+    if(!analysis.isVarying(address))
+        return false;
+    auto elementType = isRead ? mem.getSourceElementType() : mem.getDestinationElementType();
+    if(!elementType.isScalarType() || elementType.getScalarBitCount() != 32)
+        return false;
+    auto stride = analysis.getStride(address);
+    return (!stride || *stride != 4) && insertAddressVector(nullptr, nullptr, analysis, address);
+}
+
 static std::string checkVaryingValues(const Method& method, const Analysis& analysis, const ControlFlow& cf,
     const std::vector<Region>& regions, uint8_t vectorWidth)
 {
@@ -1105,8 +1166,11 @@ static std::string checkVaryingValues(const Method& method, const Analysis& anal
                         elementType.isScalarType() && stride && *stride == elementBytes * vectorWidth;
                     if(!stride || (*stride != elementBytes && !isVectorElementRead) ||
                         !isSupportedType(elementType, vectorWidth))
-                        return "memory access which is not contiguous across work-items: " + mem->to_string();
-                    if(mem->op == MemoryOperation::WRITE && maskedBlocks.find(&block) != maskedBlocks.end() &&
+                    {
+                        if(!isScatteredAccess(analysis, *mem, vectorWidth))
+                            return "memory access which is not contiguous across work-items: " + mem->to_string();
+                    }
+                    else if(mem->op == MemoryOperation::WRITE && maskedBlocks.find(&block) != maskedBlocks.end() &&
                         elementType.getScalarBitCount() != 32)
                         // see insertMaskedStore
                         return "store of 8- or 16-bit values in divergent code: " + mem->to_string();
@@ -1206,7 +1270,8 @@ static void insertCompaction(Method& method, InstructionWalker& it, const Value&
 /*
  * Converts the method: varying values become vectors with one element per work-item.
  */
-static void convertToSIMT(Method& method, const Analysis& analysis, uint8_t vectorWidth)
+static void convertToSIMT(Method& method, const Analysis& analysis, uint8_t vectorWidth,
+    FastMap<const IntermediateInstruction*, Value>& scatteredAccesses)
 {
     const auto workItemsPerQPU = static_cast<uint8_t>(SIMT_WIDTH / vectorWidth);
     auto startIt = method.walkAllInstructions();
@@ -1299,6 +1364,22 @@ static void convertToSIMT(Method& method, const Analysis& analysis, uint8_t vect
             // 3. memory accesses with per-work-item contiguous addresses: access 16 elements at the address of lane 0
             if(auto mem = it.get<MemoryInstruction>())
             {
+                if(isScatteredAccess(analysis, *mem, vectorWidth))
+                {
+                    // the per-lane addresses are calculated as a vector here, the value is converted to a vector below.
+                    // The access is split up into the lanes after the linearization of the control flow, which knows
+                    // the lanes to access.
+                    auto address = mem->op == MemoryOperation::READ ? mem->getSource() : mem->getDestination();
+                    auto addresses = insertAddressVector(&method, &it, analysis, address);
+                    if(!addresses)
+                        throw CompilationError(CompilationStep::NORMALIZER,
+                            "SIMT: failed to calculate the per-lane addresses", mem->to_string());
+                    scatteredAccesses.emplace(mem, *addresses);
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "SIMT: memory access per lane: " << mem->to_string() << logging::endl);
+                    it.nextInBlock();
+                    continue;
+                }
                 bool isRead = mem->op == MemoryOperation::READ;
                 const Value address = isRead ? mem->getSource() : mem->getDestination();
                 auto elementType = isRead ? mem->getSourceElementType() : mem->getDestinationElementType();
@@ -1563,6 +1644,87 @@ static void insertEdgeMasks(Method& method, InstructionWalker it, const BlockExi
  *
  * A VPM row write can't be masked, but a DMA of a single word writes exactly that word.
  */
+/*
+ * Replaces the access of the lanes' elements at their own (not consecutive) addresses by a loop over the lanes in the
+ * mask, each accessing its single element:
+ *
+ *   for(lane = 0; lane < 16; ++lane) if(mask[lane]) value[lane] = *address[lane] (or *address[lane] = value[lane])
+ *
+ * The lanes not in the mask may have any address, which must not be accessed (the QPUs have no MMU).
+ */
+static void insertScatteredAccess(Method& method, InstructionWalker it, const Value& mask, const Value& laneAddresses)
+{
+    auto mem = it.get<MemoryInstruction>();
+    const bool isRead = mem->op == MemoryOperation::READ;
+    const Value address = isRead ? mem->getSource() : mem->getDestination();
+    const Value value = isRead ? mem->getDestination() : mem->getSource();
+    auto elementType = (isRead ? mem->getSourceElementType() : mem->getDestinationElementType()).getElementType();
+    auto ptrType = address.type.getPointerType();
+    auto laneAddressType = method.createPointerType(elementType, ptrType->addressSpace, ptrType->alignment);
+
+    auto checkLabel = createLabel(method, "%simt_lane_check");
+    auto accessLabel = createLabel(method, "%simt_lane_access");
+    auto nextLabel = createLabel(method, "%simt_next_lane");
+    auto doneLabel = createLabel(method, "%simt_lanes_done");
+
+    auto lane = method.addNewLocal(TYPE_INT32, "%simt_lane");
+    assign(it, lane) = INT_ZERO;
+
+    // is the lane in the mask?
+    auto checkIt = method.emplaceLabel(it, std::make_unique<BranchLabel>(*checkLabel));
+    checkIt.nextInBlock();
+    auto laneActive = method.addNewLocal(TYPE_BOOL, "%simt_lane_active");
+    checkIt = insertVectorExtraction(checkIt, method, mask, lane, laneActive);
+    BranchCond activeCond = BRANCH_ALWAYS;
+    std::tie(checkIt, activeCond) = insertBranchCondition(method, checkIt, laneActive);
+    insertBranch(checkIt, accessLabel, activeCond);
+    insertBranch(checkIt, nextLabel, activeCond.invert());
+
+    // the access of the lane's element
+    auto accessIt = method.emplaceLabel(checkIt, std::make_unique<BranchLabel>(*accessLabel));
+    accessIt.nextInBlock();
+    auto laneAddress = method.addNewLocal(laneAddressType, "%simt_lane_address");
+    if(auto base = address.checkLocal() ? address.local()->getBase(true) : nullptr)
+        // the memory area accessed, e.g. for the selection of the memory access type
+        laneAddress.local()->set(ReferenceData(*base, ANY_ELEMENT));
+    accessIt = insertVectorExtraction(accessIt, method, laneAddresses, lane, laneAddress);
+    auto laneValue = method.addNewLocal(elementType, "%simt_lane_value");
+    if(isRead)
+    {
+        accessIt.emplace(
+            std::make_unique<MemoryInstruction>(MemoryOperation::READ, Value(laneValue), Value(laneAddress)));
+        accessIt.nextInBlock();
+        accessIt = insertVectorInsertion(accessIt, method, value, lane, laneValue);
+    }
+    else
+    {
+        if(value.type.isVectorType())
+            accessIt = insertVectorExtraction(accessIt, method, value, lane, laneValue);
+        else
+            // a work-group uniform value
+            assign(accessIt, laneValue) = value;
+        accessIt.emplace(
+            std::make_unique<MemoryInstruction>(MemoryOperation::WRITE, Value(laneAddress), Value(laneValue)));
+        accessIt.nextInBlock();
+    }
+    // the original access
+    accessIt.erase();
+
+    // the next lane
+    auto nextIt = method.emplaceLabel(accessIt, std::make_unique<BranchLabel>(*nextLabel));
+    nextIt.nextInBlock();
+    assign(nextIt, lane) = (lane + INT_ONE);
+    assign(nextIt, NOP_REGISTER) = (lane - Value(Literal(static_cast<uint32_t>(SIMT_WIDTH)), TYPE_INT32),
+        SetFlag::SET_FLAGS);
+    // the lane counter is the same in all SIMD elements
+    insertBranch(nextIt, checkLabel, BRANCH_ALL_N_SET);
+    insertBranch(nextIt, doneLabel, BRANCH_ANY_N_CLEAR);
+
+    // the remaining instructions of the original block
+    auto doneIt = method.emplaceLabel(nextIt, std::make_unique<BranchLabel>(*doneLabel));
+    static_cast<void>(doneIt);
+}
+
 static void insertMaskedStore(Method& method, InstructionWalker it, const Value& blockMask, const Value& entryMask)
 {
     auto store = it.get<MemoryInstruction>();
@@ -1644,7 +1806,8 @@ static void insertBlockGuard(Method& method, BasicBlock& block, const Value& mas
     static_cast<void>(activeIt);
 }
 
-static void linearizeRegion(Method& method, const ControlFlow& cf, const Region& region, const Value& entryMask)
+static void linearizeRegion(Method& method, const ControlFlow& cf, const Region& region, const Value& entryMask,
+    FastMap<const IntermediateInstruction*, Value>& scatteredAccesses)
 {
     FastMap<const BasicBlock*, Value> masks;
     for(auto b : region.blocks)
@@ -1694,7 +1857,8 @@ static void linearizeRegion(Method& method, const ControlFlow& cf, const Region&
         for(const auto& instrIt : exit.instructions)
             exitInstructions.emplace(instrIt.get());
         FastMap<const Local*, const Local*> renamed;
-        std::vector<InstructionWalker> stores;
+        // the stores (false) and the accesses lane by lane (true)
+        std::vector<std::pair<InstructionWalker, bool>> accesses;
         for(auto it = block.walk().nextInBlock(); !it.isEndOfBlock(); it.nextInBlock())
         {
             if(!it.has() || exitInstructions.find(it.get()) != exitInstructions.end())
@@ -1704,13 +1868,17 @@ static void linearizeRegion(Method& method, const ControlFlow& cf, const Region&
                 if(it->readsLocal(entry.first))
                     it->replaceLocal(entry.first, entry.second, LocalUse::Type::READER);
             }
+            bool isScattered = scatteredAccesses.find(it.get()) != scatteredAccesses.end();
             if(isMemoryWrite(*it.get()))
             {
                 auto store = it.get<MemoryInstruction>();
-                if(store->getDestinationElementType().isVectorType())
-                    stores.push_back(it);
+                if(isScattered || store->getDestinationElementType().isVectorType())
+                    accesses.emplace_back(it, isScattered);
                 continue;
             }
+            if(isScattered)
+                // the loaded value is renamed below like any other value
+                accesses.emplace_back(it, true);
             auto out = it->checkOutputLocal();
             if(!out || out->type.isLabelType() || !isUsedOutside(localBlocks, out, block))
                 continue;
@@ -1758,9 +1926,19 @@ static void linearizeRegion(Method& method, const ControlFlow& cf, const Region&
         for(auto instrIt : exit.instructions)
             instrIt.erase();
 
-        // c) stores only write the active lanes. This splits the block, so start with the last store.
-        for(auto storeIt = stores.rbegin(); storeIt != stores.rend(); ++storeIt)
-            insertMaskedStore(method, *storeIt, mask, entryMask);
+        // c) stores only write the active lanes, accesses lane by lane only access them. This splits the block, so
+        // start with the last access.
+        for(auto accessIt = accesses.rbegin(); accessIt != accesses.rend(); ++accessIt)
+        {
+            if(accessIt->second)
+            {
+                auto addresses = scatteredAccesses.at(accessIt->first.get());
+                scatteredAccesses.erase(accessIt->first.get());
+                insertScatteredAccess(method, accessIt->first, mask, addresses);
+            }
+            else
+                insertMaskedStore(method, accessIt->first, mask, entryMask);
+        }
 
         // d) skip the block if no lane is active
         insertBlockGuard(method, block, mask, nextBlock->getLabel()->getLabel());
@@ -1770,7 +1948,8 @@ static void linearizeRegion(Method& method, const ControlFlow& cf, const Region&
 /*
  * Runs the divergent regions of the converted kernel one block after the other for the lanes reaching each block.
  */
-static void linearizeDivergentControlFlow(Method& method)
+static void linearizeDivergentControlFlow(
+    Method& method, FastMap<const IntermediateInstruction*, Value>& scatteredAccesses)
 {
     auto cf = determineControlFlow(method);
     std::vector<Region> regions;
@@ -1779,7 +1958,7 @@ static void linearizeDivergentControlFlow(Method& method)
         cf, [](const Value& cond) -> bool { return cond.type.isVectorType(); }, regions);
     if(!error.empty())
         throw CompilationError(CompilationStep::NORMALIZER, "SIMT: unexpected divergent control flow", error);
-    if(regions.empty())
+    if(regions.empty() && scatteredAccesses.empty())
         return;
 
     auto entryMask = insertEntryMask(method);
@@ -1789,10 +1968,235 @@ static void linearizeDivergentControlFlow(Method& method)
             log << "SIMT: linearizing divergent region from " << cf.blocks[region.entryBlock]->to_string() << " to "
                 << cf.blocks[region.mergeBlock]->to_string() << " with " << region.blocks.size() << " blocks"
                 << logging::endl);
-        linearizeRegion(method, cf, region, entryMask);
+        linearizeRegion(method, cf, region, entryMask, scatteredAccesses);
+    }
+
+    // the accesses lane by lane outside of divergent regions access all lanes of the work-group
+    std::vector<InstructionWalker> remainingAccesses;
+    for(auto& block : method)
+    {
+        for(auto it = block.walk(); !it.isEndOfBlock(); it.nextInBlock())
+        {
+            if(it.has() && scatteredAccesses.find(it.get()) != scatteredAccesses.end())
+                remainingAccesses.push_back(it);
+        }
+    }
+    // splitting the blocks keeps the walkers of the instructions before the split position valid
+    for(auto it = remainingAccesses.rbegin(); it != remainingAccesses.rend(); ++it)
+    {
+        auto addresses = scatteredAccesses.at(it->get());
+        scatteredAccesses.erase(it->get());
+        insertScatteredAccess(method, *it, entryMask, addresses);
     }
     CPPLOG_LAZY(logging::Level::DEBUG, log << "SIMT: kernel after linearization:" << logging::endl);
     method.dumpInstructions();
+}
+
+/*
+ * Lays out the blocks in a topological order of the forward edges which keeps the blocks of every loop together (as
+ * e.g. in WebAssembly's CFG sort): every block follows all its predecessors except for loop back edges, and a loop's
+ * blocks follow its header without other blocks in between. Then the blocks of a divergent region lie between its
+ * entry and its merge point. Clang sometimes places e.g. the body of an if after the following block, which looks
+ * like a loop entered in the middle.
+ *
+ * Returns whether the order changed. Does nothing for irreducible control flow (loops with several entries).
+ */
+static bool reorderBlocks(Method& method)
+{
+    std::vector<BasicBlock*> blocks;
+    FastMap<const BasicBlock*, std::size_t> indices;
+    for(auto& block : method)
+    {
+        indices.emplace(&block, blocks.size());
+        blocks.push_back(&block);
+    }
+    const auto numBlocks = blocks.size();
+    // the successors (also by falling through to the next block) and the predecessors
+    std::vector<std::vector<std::size_t>> successors(numBlocks);
+    std::vector<std::vector<std::size_t>> predecessors(numBlocks);
+    std::vector<bool> fallsThrough(numBlocks, false);
+    for(std::size_t b = 0; b < numBlocks; ++b)
+    {
+        auto addEdge = [&](std::size_t target) {
+            if(std::find(successors[b].begin(), successors[b].end(), target) != successors[b].end())
+                return;
+            successors[b].push_back(target);
+            predecessors[target].push_back(b);
+        };
+        bool returns = false;
+        for(const auto& instr : *blocks[b])
+        {
+            if(auto branch = dynamic_cast<const Branch*>(instr.get()))
+            {
+                for(auto target : branch->getTargetLabels())
+                {
+                    auto targetBlock = method.findBasicBlock(target);
+                    if(!targetBlock)
+                        // e.g. a computed branch
+                        return false;
+                    addEdge(indices.at(targetBlock));
+                }
+            }
+            else if(dynamic_cast<const Return*>(instr.get()))
+                returns = true;
+        }
+        if(!returns && b + 1 < numBlocks && blocks[b]->fallsThroughToNextBlock(false))
+        {
+            fallsThrough[b] = true;
+            addEdge(b + 1);
+        }
+    }
+
+    // back edges (to a block on the DFS stack) and the loops they form
+    std::vector<int> state(numBlocks, 0); // 0 = not visited, 1 = on stack, 2 = done
+    std::vector<std::pair<std::size_t, std::size_t>> backEdges;
+    {
+        std::vector<std::pair<std::size_t, std::size_t>> stack{{0, 0}};
+        state[0] = 1;
+        while(!stack.empty())
+        {
+            auto& top = stack.back();
+            if(top.second < successors[top.first].size())
+            {
+                auto next = successors[top.first][top.second++];
+                if(state[next] == 1)
+                    backEdges.emplace_back(top.first, next);
+                else if(state[next] == 0)
+                {
+                    state[next] = 1;
+                    stack.emplace_back(next, 0);
+                }
+            }
+            else
+            {
+                state[top.first] = 2;
+                stack.pop_back();
+            }
+        }
+    }
+    // the blocks of the loop of every header: the header and all blocks reaching a latch without passing the header
+    FastMap<std::size_t, FastSet<std::size_t>> loops;
+    for(const auto& edge : backEdges)
+    {
+        auto& body = loops[edge.second];
+        body.emplace(edge.second);
+        std::vector<std::size_t> pending{edge.first};
+        while(!pending.empty())
+        {
+            auto current = pending.back();
+            pending.pop_back();
+            if(!body.emplace(current).second)
+                continue;
+            for(auto pred : predecessors[current])
+                pending.push_back(pred);
+        }
+    }
+    std::set<std::pair<std::size_t, std::size_t>> backEdgeSet(backEdges.begin(), backEdges.end());
+    for(const auto& loop : loops)
+    {
+        // a single entry: only the header is entered from outside the loop
+        for(auto b : loop.second)
+        {
+            if(b == loop.first)
+                continue;
+            for(auto pred : predecessors[b])
+            {
+                if(loop.second.find(pred) == loop.second.end())
+                    return false;
+            }
+        }
+    }
+
+    // topological order of the forward edges, with the blocks of the innermost loop of the last placed header first
+    std::vector<std::size_t> remainingPredecessors(numBlocks, 0);
+    for(std::size_t b = 0; b < numBlocks; ++b)
+    {
+        for(auto pred : predecessors[b])
+        {
+            if(state[pred] != 0 && backEdgeSet.find(std::make_pair(pred, b)) == backEdgeSet.end())
+                ++remainingPredecessors[b];
+        }
+    }
+    std::vector<std::size_t> order;
+    std::vector<bool> placed(numBlocks, false);
+    std::vector<std::size_t> openLoops;
+    std::set<std::size_t> ready{0};
+    while(!ready.empty())
+    {
+        // close the loops whose blocks are all placed
+        while(!openLoops.empty())
+        {
+            const auto& body = loops.at(openLoops.back());
+            if(std::any_of(body.begin(), body.end(), [&](std::size_t b) { return !placed[b]; }))
+                break;
+            openLoops.pop_back();
+        }
+        // the first ready block (in the original order) in the innermost open loop
+        auto next = ready.end();
+        for(auto it = ready.begin(); it != ready.end(); ++it)
+        {
+            if(openLoops.empty() || loops.at(openLoops.back()).count(*it))
+            {
+                next = it;
+                break;
+            }
+        }
+        if(next == ready.end())
+            // should not happen for single-entry loops
+            return false;
+        auto block = *next;
+        ready.erase(next);
+        placed[block] = true;
+        order.push_back(block);
+        if(loops.find(block) != loops.end())
+            openLoops.push_back(block);
+        for(auto succ : successors[block])
+        {
+            if(backEdgeSet.find(std::make_pair(block, succ)) != backEdgeSet.end())
+                continue;
+            if(--remainingPredecessors[succ] == 0)
+                ready.emplace(succ);
+        }
+    }
+    // unreachable blocks stay at the end
+    for(std::size_t b = 0; b < numBlocks; ++b)
+    {
+        if(!placed[b])
+            order.push_back(b);
+    }
+    // the default last block stays the last one (e.g. the work-group loop continues after it)
+    auto lastIt = std::find_if(order.begin(), order.end(), [&](std::size_t b) -> bool {
+        auto label = blocks[b]->getLabel();
+        return label && label->getLabel()->name == BasicBlock::LAST_BLOCK;
+    });
+    if(lastIt != order.end())
+    {
+        auto last = *lastIt;
+        order.erase(lastIt);
+        order.push_back(last);
+    }
+    bool changed = false;
+    for(std::size_t i = 0; i < numBlocks; ++i)
+        changed = changed || order[i] != i;
+    if(!changed)
+        return false;
+
+    // make falling through explicit, since the next block changes
+    for(std::size_t b = 0; b < numBlocks; ++b)
+    {
+        if(fallsThrough[b])
+            blocks[b]->walkEnd().emplace(std::make_unique<Branch>(blocks[b + 1]->getLabel()->getLabel()));
+    }
+    for(auto b : order)
+    {
+        auto it = method.begin();
+        while(&*it != blocks[b])
+            ++it;
+        method.moveBlock(it, method.end());
+    }
+    CPPLOG_LAZY(logging::Level::DEBUG, log << "SIMT: reordered the blocks of the kernel:" << logging::endl);
+    method.dumpInstructions();
+    return true;
 }
 
 static bool isSIMTEnabled(const Configuration& config)
@@ -1839,18 +2243,47 @@ void normalization::vectorizeWorkItems(Module& module, Method& method, const Con
             reason = "does not use work-item IDs";
         else
             reason = findDivergentRegions(cf, [&](const Value& cond) { return analysis.isVarying(cond); }, regions);
+        // the original order of the blocks, restored if the kernel isn't converted after all
+        std::vector<BasicBlock*> originalOrder;
+        for(auto& block : method)
+            originalOrder.push_back(&block);
+        bool reordered = false;
+        if(!reason.empty() && !analysis.varying.empty() && std::getenv("VC4C_NO_BLOCK_REORDER") == nullptr &&
+            reorderBlocks(method))
+        {
+            reordered = true;
+            // the blocks of the divergent regions might not have been laid out between their entry and merge point
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "SIMT: retrying with the blocks reordered after: " << reason << logging::endl);
+            cf = determineControlFlow(method);
+            analysis = analyzeVaryingValues(method, cf, vectorWidth);
+            regions.clear();
+            reason = findDivergentRegions(cf, [&](const Value& cond) { return analysis.isVarying(cond); }, regions);
+        }
         if(reason.empty())
             reason = checkVaryingValues(method, analysis, cf, regions, vectorWidth);
         if(reason.empty())
         {
-            convertToSIMT(method, analysis, vectorWidth);
-            linearizeDivergentControlFlow(method);
+            FastMap<const IntermediateInstruction*, Value> scatteredAccesses;
+            convertToSIMT(method, analysis, vectorWidth, scatteredAccesses);
+            linearizeDivergentControlFlow(method, scatteredAccesses);
             CPPLOG_LAZY(logging::Level::INFO,
                 log << "SIMT: running kernel '" << method.name << "' with "
                     << (vectorWidth > 1 ? std::to_string(vectorWidth) + " SIMD lanes per work-item" :
                                           std::string("one work-item per SIMD lane"))
                     << " (" << analysis.varying.size() << " work-item dependent values)" << logging::endl);
             return;
+        }
+        if(reordered)
+        {
+            // the kernel is not converted, keep its blocks as they were (the falls-through are explicit branches now)
+            for(auto block : originalOrder)
+            {
+                auto it = method.begin();
+                while(&*it != block)
+                    ++it;
+                method.moveBlock(it, method.end());
+            }
         }
     }
     CPPLOG_LAZY(logging::Level::INFO,
