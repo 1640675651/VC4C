@@ -1124,10 +1124,14 @@ MemoryAccessInfo normalization::determineMemoryAccess(Method& method)
     if(method.metaData.workItemLoopFrameIndex)
     {
         // The QPUs loop over their work-items (see normalization/WorkItemLoops.cpp), so private memory is needed per
-        // work-item, i.e. in the per-work-item stack frames in RAM, not in a register of the QPU
+        // work-item, i.e. in the per-work-item stack frames in RAM, not in a register of the QPU. In SIMT mode, the
+        // accesses to __local memory are vectors of 16 contiguous elements at any element offset, which the VPM
+        // can't address, so it is kept in RAM too.
         for(auto& entry : mapping)
         {
-            if(entry.first->is<StackAllocation>())
+            if(entry.first->is<StackAllocation>() ||
+                (method.metaData.mergedWorkItemsFactor > 1 &&
+                    entry.second.preferred == MemoryAccessType::VPM_SHARED_ACCESS))
             {
                 entry.second.preferred = MemoryAccessType::RAM_READ_WRITE_VPM;
                 entry.second.fallback = MemoryAccessType::RAM_READ_WRITE_VPM;

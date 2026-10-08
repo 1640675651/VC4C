@@ -1790,7 +1790,11 @@ NODISCARD static InstructionWalker lowerWriteRAM(
         // first min(mergeFactor, local_size(0) - first local ID) work-items may be written back.
         auto elementsPerWorkItem = storedElements->unsignedInt() / mergeFactor;
         auto localSizes = method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_SIZES)->createReference();
-        auto localIds = method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_IDS)->createReference();
+        // kernels looping over the chunks of their work-group: the local IDs of the current chunk, see
+        // normalization/WorkItemLoops.cpp
+        auto localIds = method.metaData.workItemLoopLocalIds ?
+            method.metaData.workItemLoopLocalIds->createReference() :
+            method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_IDS)->createReference();
         auto localSizeX = assign(it, TYPE_INT32, "%simt_local_size_x") =
             (localSizes & Value(Literal(0xFFu), TYPE_INT32));
         auto firstLocalId = assign(it, TYPE_INT32, "%simt_first_local_id") =

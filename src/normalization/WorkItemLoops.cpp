@@ -35,10 +35,12 @@ static const std::string WORK_ITEM_LOOP_BARRIER_FUNCTION = "vc4cl_work_item_loop
 // The maximum number of work-items per QPU: one per lane of the vector registers keeping their values
 static constexpr uint32_t MAX_WORK_ITEMS_PER_QPU = NATIVE_VECTOR_SIZE;
 // The maximum number of values kept per work-item across barriers in registers, i.e. of vector registers used for
-// them. The other values are kept in the work-items' stack frames in RAM.
-static constexpr std::size_t MAX_REGISTER_CONTEXTS = 16;
+// them. The other values are kept in the work-items' stack frames in RAM. The registers are occupied for the whole
+// kernel: with 16, a kernel with a 16x4 tiled matrix multiplication computed wrong addresses after the register
+// allocation fixups (cause not found), and register allocation failed more often.
+static constexpr std::size_t MAX_REGISTER_CONTEXTS = 8;
 
-static bool isWorkItemLoopsEnabled(const Configuration& config)
+bool normalization::isWorkItemLoopsEnabled(const Configuration& config)
 {
     const std::string name = WORK_ITEM_LOOPS_PASS_NAME;
     if(config.additionalDisabledOptimizations.find(name) != config.additionalDisabledOptimizations.end())
@@ -185,6 +187,9 @@ public:
             return false;
         if(loc->is<Parameter>() || loc->is<Global>())
             return true;
+        if(auto builtin = loc->as<BuiltinLocal>())
+            // e.g. the local sizes, but not the local IDs (of the QPU's first work-item)
+            return builtin->isWorkGroupUniform();
         if(!isCodeLocal(loc) || loc->countUsers(LocalUse::Type::WRITER) != 1)
             return false;
         auto it = invariant.find(loc);
@@ -268,9 +273,6 @@ struct BarrierInfo
 
 static std::string checkKernel(Method& method, std::vector<BarrierInfo>& barriers)
 {
-    if(method.metaData.mergedWorkItemsFactor > 1)
-        return "runs in SIMT mode";
-
     // split the blocks so every barrier starts its own block
     std::vector<InstructionWalker> barrierCalls;
     for(auto& block : method)
@@ -386,6 +388,11 @@ static void insertConditionalLoopBranch(Method& method, InstructionWalker& it, c
  * - the local linear ID of the current work-item and the work-group size (the loop runs while the ID is smaller),
  * - the index of the current work-item on the QPU (the lane of the vectors keeping the values per work-item),
  * - the packed local IDs (x | y << 8 | z << 16) of the QPU's work-items, one per lane.
+ *
+ * In SIMT mode, a "work-item" of the loop is a chunk of up to 16 consecutive work-items in x of a row of the
+ * work-group (the same local IDs in y and z), as the run-time deals them to the QPUs for kernels without barriers. The
+ * linear ID is the index of the chunk, the work-group size the number of chunks, and the local IDs those of the chunk's
+ * first work-item. The QPU's work-items are the lanes of its registers, see normalization/SIMT.cpp.
  */
 struct LoopState
 {
@@ -398,7 +405,7 @@ struct LoopState
     const Local* currentLocalIds = nullptr;
 };
 
-static LoopState insertLoopSetup(Method& method, InstructionWalker& it)
+static LoopState insertLoopSetup(Method& method, InstructionWalker& it, uint8_t chunkWidth)
 {
     LoopState state;
     const auto vectorType = TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE);
@@ -420,11 +427,24 @@ static LoopState insertLoopSetup(Method& method, InstructionWalker& it)
     auto idX = extractByte(uniformIds, 0, "%work_item_loop_id_x");
     auto idY = extractByte(uniformIds, 1, "%work_item_loop_id_y");
     auto idZ = extractByte(uniformIds, 2, "%work_item_loop_id_z");
-    auto sizeXY = assign(it, TYPE_INT32, "%work_item_loop_size_xy") = mul24(sizeX, sizeY);
+    // the chunks of a row (in SIMT mode), the work-items of a row otherwise
+    uint32_t chunkShift = 0;
+    while((1u << chunkShift) < chunkWidth)
+        ++chunkShift;
+    auto chunksX = sizeX;
+    if(chunkWidth > 1)
+    {
+        auto tmpX = assign(it, TYPE_INT32, "%work_item_loop_chunks_x") =
+            sizeX + Value(Literal(chunkWidth - 1u), TYPE_INT32);
+        chunksX = assign(it, TYPE_INT32, "%work_item_loop_chunks_x") =
+            as_unsigned{tmpX} >> Value(Literal(chunkShift), TYPE_INT32);
+        idX = assign(it, TYPE_INT32, "%work_item_loop_id_x") = as_unsigned{idX} >> Value(Literal(chunkShift), TYPE_INT32);
+    }
+    auto sizeXY = assign(it, TYPE_INT32, "%work_item_loop_size_xy") = mul24(chunksX, sizeY);
     state.groupSize = assign(it, TYPE_INT32, "%work_item_loop_group_size") = mul24(sizeXY, sizeZ);
     // the QPU runs the work-items qpuIndex + k * numQPUs, the run-time starts QPU i with the local ID of work-item i
     auto offsetZ = assign(it, TYPE_INT32, "%work_item_loop_qpu_index") = mul24(idZ, sizeXY);
-    auto offsetY = assign(it, TYPE_INT32, "%work_item_loop_qpu_index") = mul24(idY, sizeX);
+    auto offsetY = assign(it, TYPE_INT32, "%work_item_loop_qpu_index") = mul24(idY, chunksX);
     auto tmp = assign(it, TYPE_INT32, "%work_item_loop_qpu_index") = offsetZ + offsetY;
     state.qpuIndex = assign(it, TYPE_INT32, "%work_item_loop_qpu_index") = tmp + idX;
     state.numQPUs = assign(it, TYPE_INT32, "%work_item_loop_num_qpus") =
@@ -435,13 +455,16 @@ static LoopState insertLoopSetup(Method& method, InstructionWalker& it)
     const auto shortVectorType = TYPE_INT16.toVectorType(NATIVE_VECTOR_SIZE);
     auto laneOffsets = assign(it, vectorType, "%work_item_loop_ids") = mul24(ELEMENT_NUMBER_REGISTER, state.numQPUs);
     auto linearIds = assign(it, shortVectorType, "%work_item_loop_ids") = laneOffsets + state.qpuIndex;
-    auto shortSizeX = assign(it, TYPE_INT16, "%work_item_loop_size_x") = sizeX;
+    auto shortSizeX = assign(it, TYPE_INT16, "%work_item_loop_size_x") = chunksX;
     auto shortSizeY = assign(it, TYPE_INT16, "%work_item_loop_size_y") = sizeY;
     auto quotientX = method.addNewLocal(shortVectorType, "%work_item_loop_ids");
     it.emplace(std::make_unique<IntrinsicOperation>("udiv", Value(quotientX), Value(linearIds), Value(shortSizeX)));
     it.nextInBlock();
-    auto product = assign(it, vectorType, "%work_item_loop_ids") = mul24(quotientX, sizeX);
+    auto product = assign(it, vectorType, "%work_item_loop_ids") = mul24(quotientX, chunksX);
     auto localX = assign(it, vectorType, "%work_item_loop_ids") = linearIds - product;
+    if(chunkWidth > 1)
+        // the local ID in x of the chunk's first work-item
+        localX = assign(it, vectorType, "%work_item_loop_ids") = localX << Value(Literal(chunkShift), TYPE_INT32);
     auto localZ = method.addNewLocal(shortVectorType, "%work_item_loop_ids");
     it.emplace(std::make_unique<IntrinsicOperation>("udiv", Value(localZ), Value(quotientX), Value(shortSizeY)));
     it.nextInBlock();
@@ -509,10 +532,14 @@ static FastMap<const Local*, Context> createContexts(Method& method, const std::
     });
     FastMap<const Local*, Context> contexts;
     std::size_t numRegisters = 0;
+    // for debugging: a lower number of values kept in registers
+    std::size_t maxRegisters = MAX_REGISTER_CONTEXTS;
+    if(auto env = std::getenv("VC4C_WORK_ITEM_LOOP_REGISTERS"))
+        maxRegisters = std::min(maxRegisters, static_cast<std::size_t>(std::atoi(env)));
     for(auto loc : values)
     {
         Context context;
-        if(numRegisters < MAX_REGISTER_CONTEXTS && (loc->type.isScalarType() || loc->type.getPointerType()))
+        if(numRegisters < maxRegisters && (loc->type.isScalarType() || loc->type.getPointerType()))
         {
             context.vector = method.addNewLocal(TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE), "%work_item_loop_context");
             ++numRegisters;
@@ -547,6 +574,14 @@ static void insertRestore(Method& method, InstructionWalker& it, const LoopState
             it.emplace(std::make_unique<MemoryInstruction>(
                 MemoryOperation::READ, Value(tmp), context.variable->createReference()));
             it.nextInBlock();
+            if(context.storageType.isScalarType())
+            {
+                // A scalar loaded via the VPM is only set in the first lane, but in SIMT mode, a uniform value is
+                // used by all lanes
+                auto replicated = method.addNewLocal(context.storageType, "%work_item_loop_restore");
+                it = insertReplication(it, tmp, replicated);
+                tmp = replicated;
+            }
             assign(it, loc->createReference()) = tmp;
             continue;
         }
@@ -703,8 +738,23 @@ static void convertToWorkItemLoops(Method& method, const std::vector<BarrierInfo
     auto currentRegion = method.addNewLocal(TYPE_INT32, "%work_item_loop_region");
 
     // the start of the kernel: loop setup and the start of the first region
+    auto chunkWidth = std::max(method.metaData.mergedWorkItemsFactor, uint8_t{1});
     auto it = method.begin()->walk().nextInBlock();
-    auto state = insertLoopSetup(method, it);
+    auto state = insertLoopSetup(method, it, chunkWidth);
+    if(auto uniformIds = method.findBuiltin(BuiltinLocal::Type::LOCAL_IDS))
+    {
+        // In SIMT mode, the kernel reads the local IDs of the QPU's first work-item (e.g. for the lanes active in the
+        // work-group), which are those of the current chunk instead. Only the loop setup reads the UNIFORM.
+        for(auto& block : method)
+        {
+            auto instrIt = &block == &*method.begin() ? it.copy() : block.walk();
+            for(; !instrIt.isEndOfBlock(); instrIt.nextInBlock())
+            {
+                if(instrIt.has() && instrIt->readsLocal(uniformIds))
+                    instrIt->replaceLocal(uniformIds, state.currentLocalIds, LocalUse::Type::READER);
+            }
+        }
+    }
     for(const auto& context : contexts)
     {
         if(!context.second.variable)
@@ -765,12 +815,141 @@ static void convertToWorkItemLoops(Method& method, const std::vector<BarrierInfo
     method.metaData.workItemLoopFrameIndex = state.linearId.local();
 }
 
+// Whether the local is only used as the (whole) address of loads and stores of its type, by life-time markers and by
+// moves (pointer casts) only used by life-time markers
+static bool isPromotable(const StackAllocation& alloc)
+{
+    auto elementType = alloc.type.getElementType();
+    if(!elementType.isSimpleType())
+        return false;
+    for(const auto& user : alloc.getUsers())
+    {
+        auto instr = user.first;
+        if(instr->hasConditionalExecution())
+            return false;
+        if(dynamic_cast<const LifetimeBoundary*>(instr))
+            continue;
+        if(auto mem = dynamic_cast<const MemoryInstruction*>(instr))
+        {
+            auto numEntries = mem->getNumEntries().getLiteralValue();
+            if(!numEntries || numEntries->unsignedInt() != 1)
+                return false;
+            if(mem->op == MemoryOperation::READ && mem->getSource().hasLocal(&alloc) &&
+                mem->getDestination().type == elementType && !mem->getDestination().hasLocal(&alloc))
+                continue;
+            if(mem->op == MemoryOperation::WRITE && mem->getDestination().hasLocal(&alloc) &&
+                mem->getSource().type == elementType && !mem->getSource().hasLocal(&alloc))
+                continue;
+            return false;
+        }
+        if(auto move = dynamic_cast<const MoveOperation*>(instr))
+        {
+            auto out = move->checkOutputLocal();
+            if(!out || move->hasSideEffects() || out->type.getPointerType() == nullptr)
+                return false;
+            bool onlyLifetime = true;
+            for(const auto& castUser : out->getUsers())
+            {
+                if(castUser.first != instr && !dynamic_cast<const LifetimeBoundary*>(castUser.first))
+                    onlyLifetime = false;
+            }
+            if(onlyLifetime)
+                continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+void normalization::promoteSimpleStackAllocations(Method& method)
+{
+    FastMap<const Local*, Value> promoted;
+    for(const auto& alloc : method.stackAllocations)
+    {
+        if(isPromotable(alloc))
+            promoted.emplace(&alloc, method.addNewLocal(alloc.type.getElementType(), alloc.name, "promoted"));
+    }
+    if(promoted.empty())
+        return;
+    for(auto& block : method)
+    {
+        for(auto it = block.walk(); !it.isEndOfBlock(); it.nextInBlock())
+        {
+            if(!it.has())
+                continue;
+            if(auto lifetime = it.get<LifetimeBoundary>())
+            {
+                auto loc = lifetime->getStackAllocation().checkLocal();
+                if(loc && promoted.find(loc) != promoted.end())
+                    it.reset(std::make_unique<Nop>(DelayType::WAIT_REGISTER));
+                continue;
+            }
+            if(auto move = it.get<MoveOperation>())
+            {
+                auto src = move->getSource().checkLocal();
+                if(src && promoted.find(src) != promoted.end())
+                    // a cast only used by life-time markers, erased above or below
+                    it.reset(std::make_unique<Nop>(DelayType::WAIT_REGISTER));
+                continue;
+            }
+            if(auto mem = it.get<MemoryInstruction>())
+            {
+                if(mem->op == MemoryOperation::READ)
+                {
+                    auto src = mem->getSource().checkLocal();
+                    auto entry = src ? promoted.find(src) : promoted.end();
+                    if(entry != promoted.end())
+                        it.reset(std::make_unique<MoveOperation>(mem->getDestination(), entry->second));
+                }
+                else if(mem->op == MemoryOperation::WRITE)
+                {
+                    auto dest = mem->getDestination().checkLocal();
+                    auto entry = dest ? promoted.find(dest) : promoted.end();
+                    if(entry != promoted.end())
+                        it.reset(std::make_unique<MoveOperation>(entry->second, mem->getSource()));
+                }
+            }
+        }
+    }
+    // the life-time markers of the casts
+    for(auto& block : method)
+    {
+        for(auto it = block.walk(); !it.isEndOfBlock(); it.nextInBlock())
+        {
+            auto lifetime = it.has() ? it.get<LifetimeBoundary>() : nullptr;
+            auto loc = lifetime ? lifetime->getStackAllocation().checkLocal() : nullptr;
+            if(loc && loc->getUsers(LocalUse::Type::WRITER).empty() && loc->type.getPointerType() &&
+                !loc->is<StackAllocation>())
+                it.reset(std::make_unique<Nop>(DelayType::WAIT_REGISTER));
+        }
+    }
+    for(auto it = method.stackAllocations.begin(); it != method.stackAllocations.end();)
+    {
+        if(promoted.find(&*it) != promoted.end() && it->getUsers().empty())
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Promoted private variable to a local: " << it->to_string() << logging::endl);
+            it = method.stackAllocations.erase(it);
+        }
+        else
+            ++it;
+    }
+}
+
 void normalization::loopWorkItems(Module& module, Method& method, const Configuration& config)
 {
     if(!isWorkItemLoopsEnabled(config))
         return;
+    if(method.metaData.getFixedWorkGroupSize() && *method.metaData.getFixedWorkGroupSize() <= NUM_QPUS)
+        // all work-items of the required work-group size run on their own QPU anyway
+        return;
     std::vector<BarrierInfo> barriers;
     auto reason = checkKernel(method, barriers);
+    if(!reason.empty() && method.metaData.mergedWorkItemsFactor > 1 && reason != "has no barriers")
+        // SIMT mode only converts kernels with barriers or __local memory if they can loop over their chunks, since
+        // the run-time would run several work-groups at the same time, sharing the __local memory
+        throw CompilationError(CompilationStep::NORMALIZER,
+            "Work-item loops not supported for SIMT kernel '" + method.name + "'", reason);
     if(!reason.empty())
     {
         if(reason != "has no barriers")
@@ -781,6 +960,7 @@ void normalization::loopWorkItems(Module& module, Method& method, const Configur
     convertToWorkItemLoops(method, barriers);
     CPPLOG_LAZY(logging::Level::INFO,
         log << "Work-item loops: kernel '" << method.name << "' runs up to " << MAX_WORK_ITEMS_PER_QPU
-            << " work-items per QPU (" << barriers.size() << " barriers)" << logging::endl);
+            << (method.metaData.mergedWorkItemsFactor > 1 ? " chunks of work-items" : " work-items") << " per QPU ("
+            << barriers.size() << " barriers)" << logging::endl);
     method.dumpInstructions();
 }

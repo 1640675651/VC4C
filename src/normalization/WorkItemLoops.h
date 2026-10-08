@@ -17,6 +17,9 @@ namespace vc4c
         // The name of the optimization pass, which can be disabled via --fno-work-item-loops
         extern const char* const WORK_ITEM_LOOPS_PASS_NAME;
 
+        // Whether the pass is enabled (also disabled by the environment variable VC4C_NO_WORK_ITEM_LOOPS)
+        bool isWorkItemLoopsEnabled(const Configuration& config);
+
         /*
          * Lets kernels with barriers run work-groups of more work-items than QPUs.
          *
@@ -35,14 +38,27 @@ namespace vc4c
          * region then ends at the next barrier reached, and the loop over the work-items continues with the region
          * the QPU is in.
          *
-         * Up to 16 such values (scalars of at most 32 bits or pointers) are kept in registers, all others (also
+         * Up to 8 such values (scalars of at most 32 bits or pointers) are kept in registers, all others (also
          * vectors) in a private variable in the work-item's stack frame in RAM. Private memory (stack allocations) is
          * per work-item: every work-item has its own stack frame. Kernels keeping 64-bit values across barriers are
          * not changed and keep the limit of one work-item per QPU.
          *
-         * NOTE: Needs to run before the work-item functions and barriers are intrinsified.
+         * In SIMT mode (see normalization/SIMT.cpp), the QPUs loop over the chunks of up to 16 work-items of their
+         * work-group instead (the lanes of the QPU's registers). All values kept per chunk across barriers are vectors,
+         * kept in RAM.
+         *
+         * NOTE: Needs to run after the SIMT conversion and before the work-item functions and barriers are
+         * intrinsified.
          */
         void loopWorkItems(Module& module, Method& method, const Configuration& config);
+
+        /*
+         * Replaces private variables (stack allocations) of a scalar or vector type, which are only loaded and stored
+         * as a whole, by locals. Clang keeps some of them (e.g. with life-time markers), which VC4C would lower into
+         * registers later, but which the SIMT conversion and the work-item loops would otherwise need to keep in
+         * memory (per work-item).
+         */
+        void promoteSimpleStackAllocations(Method& method);
     } // namespace normalization
 } // namespace vc4c
 

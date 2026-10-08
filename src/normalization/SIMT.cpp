@@ -12,6 +12,7 @@
 #include "../intermediate/VectorHelper.h"
 #include "../intermediate/operators.h"
 #include "../intrinsics/WorkItems.h"
+#include "WorkItemLoops.h"
 #include "log.h"
 
 #include <cstdlib>
@@ -37,10 +38,15 @@ namespace
     struct LaneInfo
     {
         Optional<int64_t> stride;
+        // Whether the value in lane i is 16 * u + i for some u >= 0 (the same for all lanes), e.g. the local ID in x
+        // (the chunks of work-items start at multiples of 16). Then dividing it by a multiple of 16 gives the same
+        // value in all lanes, e.g. for the index of the row in tid / 16 with tid = get_local_id(0) + 16 *
+        // get_local_id(1).
+        bool aligned = false;
 
         bool operator==(const LaneInfo& other) const
         {
-            return stride == other.stride;
+            return stride == other.stride && aligned == other.aligned;
         }
     };
 
@@ -52,6 +58,16 @@ namespace
         {
             auto loc = val.checkLocal();
             return loc && varying.find(loc) != varying.end();
+        }
+
+        bool isAligned(const Value& val) const
+        {
+            if(auto loc = val.checkLocal())
+            {
+                auto it = varying.find(loc);
+                return it != varying.end() && it->second.aligned;
+            }
+            return false;
         }
 
         Optional<int64_t> getStride(const Value& val) const
@@ -234,15 +250,28 @@ static Optional<int32_t> getDimension(const MethodCall& call)
     return {};
 }
 
+static bool isBarrier(const MethodCall& call)
+{
+    return call.methodName == "vc4cl_barrier";
+}
+
 /*
  * Rejects kernels using functionality which is not (yet) supported in SIMT mode. Returns the reason, or an empty
  * string if the kernel might be supported.
+ *
+ * Kernels with barriers or __local memory are supported if the QPUs can loop over the chunks of work-items of their
+ * work-group (see normalization/WorkItemLoops.cpp): then the run-time runs a single work-group at a time, and a barrier
+ * synchronizes the QPUs after all chunks reached it.
  */
-static std::string checkUnsupported(const Method& method, uint8_t vectorWidth)
+static std::string checkUnsupported(const Method& method, uint8_t vectorWidth, bool allowWorkGroupSync)
 {
+    // Any dimensions work, since the run-time deals chunks of up to 16 work-items of a row (same local IDs in y and
+    // z) to the QPUs
     const auto& sizes = method.metaData.workGroupSizes;
-    if(sizes[0] != 0 && (sizes[0] > NUM_QPUS * SIMT_WIDTH || sizes[1] > 1 || sizes[2] > 1))
-        return "required work-group size is larger than 192 or not 1-dimensional";
+    if(sizes[0] != 0 &&
+        static_cast<uint32_t>(sizes[0]) * std::max(sizes[1], uint32_t{1}) * std::max(sizes[2], uint32_t{1}) >
+            NUM_QPUS * SIMT_WIDTH)
+        return "required work-group size is larger than 192";
     if(!method.stackAllocations.empty())
         return "uses private memory (stack allocations)";
     for(const auto& param : method.parameters)
@@ -251,7 +280,7 @@ static std::string checkUnsupported(const Method& method, uint8_t vectorWidth)
             return "parameter type " + param.type.to_string();
         if(auto ptrType = param.type.getPointerType())
         {
-            if(ptrType->addressSpace == AddressSpace::LOCAL)
+            if(ptrType->addressSpace == AddressSpace::LOCAL && !allowWorkGroupSync)
                 return "uses __local memory";
         }
     }
@@ -267,6 +296,8 @@ static std::string checkUnsupported(const Method& method, uint8_t vectorWidth)
                 return "uses synchronization: " + instr->to_string();
             if(auto call = dynamic_cast<const MethodCall*>(instr.get()))
             {
+                if(allowWorkGroupSync && isBarrier(*call))
+                    continue;
                 // printf() writes one record per QPU, see LowerPrintf
                 for(const char* unsupported : {"barrier", "atomic", "mutex", "semaphore", "dma", "vpm", "fence", "async",
                         "prefetch", "linear_id", "printf"})
@@ -315,7 +346,7 @@ static std::string checkUnsupported(const Method& method, uint8_t vectorWidth)
                 if(ptrType && ptrType->addressSpace == AddressSpace::LOCAL)
                     usesLocalMemory = true;
             });
-            if(usesLocalMemory)
+            if(usesLocalMemory && !allowWorkGroupSync)
                 return "uses __local memory: " + instr->to_string();
         }
     }
@@ -716,6 +747,7 @@ static void markVarying(Analysis& analysis, const Local* loc, LaneInfo info, boo
     {
         // written with different strides (e.g. by several phi-node moves)
         it->second.stride = {};
+        it->second.aligned = false;
         changed = true;
     }
 }
@@ -725,6 +757,85 @@ static Optional<int64_t> scaleStride(Optional<int64_t> stride, int64_t factor)
     if(!stride)
         return {};
     return *stride * factor;
+}
+
+// The power of two (at least 16) of the literal, if it is one
+static Optional<uint32_t> getMultipleOf16Shift(const Value& val)
+{
+    auto lit = val.getLiteralValue();
+    if(!lit || lit->signedInt() < 16 || (lit->unsignedInt() & (lit->unsignedInt() - 1)) != 0)
+        return {};
+    uint32_t shift = 0;
+    while((1u << shift) < lit->unsignedInt())
+        ++shift;
+    return shift;
+}
+
+/*
+ * Whether the work-group uniform value is not negative (assuming no overflows), e.g. the work-item IDs and sizes and
+ * values computed from them by additions, multiplications and shifts.
+ */
+static bool isNonNegativeUniform(const Analysis& analysis, const Value& val, unsigned depth = 0)
+{
+    if(analysis.isVarying(val) || depth > 8)
+        return false;
+    if(auto lit = val.getLiteralValue())
+        return lit->signedInt() >= 0;
+    auto loc = val.checkLocal();
+    auto writer = loc ? loc->getSingleWriter() : nullptr;
+    if(!writer || writer->hasConditionalExecution() || writer->hasUnpackMode() || writer->hasPackMode())
+        return false;
+    if(auto call = dynamic_cast<const MethodCall*>(writer))
+        return isWorkItemFunction(*call);
+    if(auto move = dynamic_cast<const MoveOperation*>(writer))
+        return !move->getVectorRotation() && isNonNegativeUniform(analysis, move->getSource(), depth + 1);
+    auto op = dynamic_cast<const Operation*>(writer);
+    auto intrinsic = dynamic_cast<const IntrinsicOperation*>(writer);
+    bool isSupported = (op && (op->op == OP_ADD || op->op == OP_SHL || op->op == OP_SHR || op->op == OP_AND)) ||
+        (intrinsic && (intrinsic->opCode == "mul" || intrinsic->opCode == "zext" || intrinsic->opCode == "udiv"));
+    if(!isSupported)
+        return false;
+    for(const auto& arg : writer->getArguments())
+    {
+        if(!isNonNegativeUniform(analysis, arg, depth + 1))
+            return false;
+    }
+    return true;
+}
+
+// Whether the work-group uniform value is a non-negative multiple of 16 (assuming no overflows)
+static bool isUniformMultipleOf16(const Analysis& analysis, const Value& val, unsigned depth = 0)
+{
+    if(analysis.isVarying(val) || depth > 8)
+        return false;
+    if(auto lit = val.getLiteralValue())
+        return lit->signedInt() >= 0 && lit->unsignedInt() % 16 == 0;
+    auto loc = val.checkLocal();
+    auto writer = loc ? loc->getSingleWriter() : nullptr;
+    if(!writer || writer->hasConditionalExecution() || writer->hasUnpackMode() || writer->hasPackMode())
+        return false;
+    auto arg0 = writer->getArgument(0);
+    auto arg1 = writer->getArgument(1);
+    if(auto move = dynamic_cast<const MoveOperation*>(writer))
+        return !move->getVectorRotation() && isUniformMultipleOf16(analysis, move->getSource(), depth + 1);
+    if(auto op = dynamic_cast<const Operation*>(writer))
+    {
+        if(op->op == OP_SHL && arg0 && arg1)
+        {
+            auto shift = arg1->getLiteralValue();
+            return shift && shift->signedInt() >= 4 && shift->signedInt() < 31 &&
+                isNonNegativeUniform(analysis, *arg0, depth + 1);
+        }
+        if(op->op == OP_ADD && arg0 && arg1)
+            return isUniformMultipleOf16(analysis, *arg0, depth + 1) &&
+                isUniformMultipleOf16(analysis, *arg1, depth + 1);
+        return false;
+    }
+    auto intrinsic = dynamic_cast<const IntrinsicOperation*>(writer);
+    if(intrinsic && intrinsic->opCode == "mul" && arg0 && arg1)
+        return (isUniformMultipleOf16(analysis, *arg0, depth + 1) && isNonNegativeUniform(analysis, *arg1, depth + 1)) ||
+            (isUniformMultipleOf16(analysis, *arg1, depth + 1) && isNonNegativeUniform(analysis, *arg0, depth + 1));
+    return false;
 }
 
 /*
@@ -738,10 +849,27 @@ static LaneInfo determineLaneInfo(const Analysis& analysis, const IntermediateIn
 
     auto arg0 = instr.getArgument(0);
     auto arg1 = instr.getArgument(1);
+    {
+        // values computed only from values which are the same in all lanes (stride 0, e.g. tid / 16, see LaneInfo)
+        // and uniform values are the same in all lanes too
+        auto move = dynamic_cast<const MoveOperation*>(&instr);
+        bool sameInAllLanes = arg0 && !(move && move->getVectorRotation()) &&
+            (dynamic_cast<const Operation*>(&instr) || dynamic_cast<const IntrinsicOperation*>(&instr) || move);
+        for(const auto& arg : instr.getArguments())
+        {
+            if(arg.checkRegister())
+                // e.g. the element number
+                sameInAllLanes = false;
+            else if(analysis.isVarying(arg) && analysis.getStride(arg) != int64_t{0})
+                sameInAllLanes = false;
+        }
+        if(sameInAllLanes)
+            return LaneInfo{int64_t{0}};
+    }
     if(auto move = dynamic_cast<const MoveOperation*>(&instr))
     {
         if(!move->getVectorRotation() && !instr.hasUnpackMode() && !instr.hasPackMode())
-            return LaneInfo{analysis.getStride(move->getSource())};
+            return LaneInfo{analysis.getStride(move->getSource()), analysis.isAligned(move->getSource())};
         return LaneInfo{};
     }
     if(auto op = dynamic_cast<const Operation*>(&instr))
@@ -752,8 +880,17 @@ static LaneInfo determineLaneInfo(const Analysis& analysis, const IntermediateIn
         {
             auto s0 = analysis.getStride(*arg0);
             auto s1 = analysis.getStride(*arg1);
+            bool aligned = (analysis.isAligned(*arg0) && isUniformMultipleOf16(analysis, *arg1)) ||
+                (analysis.isAligned(*arg1) && isUniformMultipleOf16(analysis, *arg0));
             if(s0 && s1)
-                return LaneInfo{*s0 + *s1};
+                return LaneInfo{*s0 + *s1, aligned};
+        }
+        if((op->op == OP_SHR || op->op == OP_ASR) && arg1 && analysis.isAligned(*arg0))
+        {
+            // (16 * u + i) >> k is u >> (k - 4) in all lanes
+            auto shift = arg1->getLiteralValue();
+            if(shift && !analysis.isVarying(*arg1) && shift->signedInt() >= 4 && shift->signedInt() < 32)
+                return LaneInfo{int64_t{0}};
         }
         if(op->op == OP_SUB && arg1)
         {
@@ -786,8 +923,12 @@ static LaneInfo determineLaneInfo(const Analysis& analysis, const IntermediateIn
             auto loc = arg0->checkLocal();
             auto call = loc ? dynamic_cast<const MethodCall*>(loc->getSingleWriter()) : nullptr;
             if(call && isWorkItemIdCall(*call))
-                return LaneInfo{analysis.getStride(*arg0)};
+                return LaneInfo{analysis.getStride(*arg0), analysis.isAligned(*arg0)};
         }
+        if((intrinsic->opCode == "sdiv" || intrinsic->opCode == "udiv") && arg0 && arg1 &&
+            analysis.isAligned(*arg0) && getMultipleOf16Shift(*arg1))
+            // (16 * u + i) / 2^k is u / 2^(k - 4) in all lanes (u is not negative)
+            return LaneInfo{int64_t{0}};
         return LaneInfo{};
     }
     return LaneInfo{};
@@ -796,7 +937,7 @@ static LaneInfo determineLaneInfo(const Analysis& analysis, const IntermediateIn
 /*
  * Determines all values which differ between the work-items of a QPU.
  */
-static Analysis analyzeVaryingValues(Method& method, const ControlFlow& cf)
+static Analysis analyzeVaryingValues(Method& method, const ControlFlow& cf, uint8_t vectorWidth)
 {
     Analysis analysis;
     auto localBlocks = determineLocalBlocks(method);
@@ -820,8 +961,11 @@ static Analysis analyzeVaryingValues(Method& method, const ControlFlow& cf)
                     if(isWorkItemIdCall(*call))
                     {
                         auto dim = getDimension(*call);
+                        // the chunks of work-items start at multiples of 16 in x, so the local ID in lane i is 16 * u + i
                         if(dim && *dim == 0 && out)
-                            markVarying(analysis, out, LaneInfo{int64_t{1}}, changed);
+                            markVarying(analysis, out,
+                                LaneInfo{int64_t{1}, vectorWidth == 1 && call->methodName == intrinsics::FUNCTION_NAME_LOCAL_ID},
+                                changed);
                         // dimensions 1 and 2 are uniform, since SIMT mode is only used for 1-dimensional work-groups
                         continue;
                     }
@@ -940,6 +1084,11 @@ static std::string checkVaryingValues(const Method& method, const Analysis& anal
                 if(!branch->isUnconditional() && varyingFlags && divergentBlocks.find(&block) == divergentBlocks.end())
                     return "unsupported divergent branch: " + branch->to_string();
             }
+            auto call = dynamic_cast<const MethodCall*>(instr.get());
+            if(call && isBarrier(*call) && maskedBlocks.find(&block) != maskedBlocks.end())
+                // OpenCL requires all work-items to reach the barrier, i.e. the kernel is invalid or the condition was
+                // wrongly determined to differ between the work-items
+                return "barrier in divergent control flow: " + call->to_string();
             if(auto mem = dynamic_cast<const MemoryInstruction*>(instr.get()))
             {
                 const auto& address = mem->op == MemoryOperation::READ ? mem->getSource() : mem->getDestination();
@@ -1216,6 +1365,17 @@ static void convertToSIMT(Method& method, const Analysis& analysis, uint8_t vect
                     }
                     CPPLOG_LAZY(logging::Level::DEBUG,
                         log << "SIMT: memory access per work-item: " << mem->to_string() << logging::endl);
+                }
+                else if(vectorWidth == 1 && isRead && !elementType.isVectorType())
+                {
+                    // A value loaded from a work-group uniform address is the same for all work-items, but a load via
+                    // the VPM only sets it in the first lane
+                    const Value dest = mem->getDestination();
+                    auto loaded = method.addNewLocal(dest.type, "%simt_loaded");
+                    mem->setOutput(loaded);
+                    it.nextInBlock();
+                    it = insertReplication(it, loaded, dest);
+                    continue;
                 }
                 else if(vectorWidth > 1 && isRead && elementType.isVectorType())
                 {
@@ -1659,11 +1819,12 @@ void normalization::vectorizeWorkItems(Module& module, Method& method, const Con
 
     std::string vectorTypes;
     auto vectorWidth = determineVectorWidth(method, vectorTypes);
-    auto reason = vectorWidth ? checkUnsupported(method, vectorWidth) : "unsupported vector types:" + vectorTypes;
+    auto reason = vectorWidth ? checkUnsupported(method, vectorWidth, normalization::isWorkItemLoopsEnabled(config)) :
+                                "unsupported vector types:" + vectorTypes;
     if(reason.empty())
     {
         auto cf = determineControlFlow(method);
-        auto analysis = analyzeVaryingValues(method, cf);
+        auto analysis = analyzeVaryingValues(method, cf, vectorWidth);
         CPPLOG_LAZY_BLOCK(logging::Level::DEBUG, {
             for(const auto& entry : analysis.varying)
             {

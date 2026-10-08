@@ -322,6 +322,11 @@ void Normalizer::normalizeMethod(Module& module, Method& method, const std::set<
 
     PROFILE_START(NormalizationPasses);
 
+    // private variables of simple types (which VC4C lowers into registers anyway) are values per work-item, which the
+    // SIMT conversion and the work-item loops can handle better than memory
+    if(isWorkItemLoopsEnabled(config))
+        promoteSimpleStackAllocations(method);
+
     // converts the kernel to run one work-item per SIMD lane, if possible. Needs to run before the work-item functions
     // are intrinsified.
     if(selectedSteps.empty() || selectedSteps.find("SIMT") != selectedSteps.end())

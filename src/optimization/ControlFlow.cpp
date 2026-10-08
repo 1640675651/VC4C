@@ -1057,8 +1057,6 @@ std::size_t optimizations::addWorkGroupLoop(const Module& module, Method& method
 {
     if(method.walkAllInstructions().isEndOfMethod())
         return 0u;
-    if(method.metaData.mergedWorkItemsFactor > 1 || hasIndependentWorkItems(method))
-        return addIndependentWorkGroupLoop(method);
     if(method.metaData.workItemLoopLocalIds)
     {
         // XXX Kernels whose QPUs loop over their work-items (see normalization/WorkItemLoops.cpp) computed wrong results
@@ -1069,6 +1067,8 @@ std::size_t optimizations::addWorkGroupLoop(const Module& module, Method& method
                 << " in a work-group loop, since it loops over the work-items of its QPUs" << logging::endl);
         return 0u;
     }
+    if(method.metaData.mergedWorkItemsFactor > 1 || hasIndependentWorkItems(method))
+        return addIndependentWorkGroupLoop(method);
     CPPLOG_LAZY(
         logging::Level::DEBUG, log << "Wrapping kernel " << method.name << " in a work-group loop..." << logging::endl);
 

@@ -680,7 +680,13 @@ static void lowerBarrier(Method& method, InstructionWalker it,
     Optional<std::pair<Value, Value>> explicitIndexAndCount = {})
 {
     if(!explicitIndexAndCount && method.metaData.workItemLoopLocalIds)
+    {
+        if(method.metaData.mergedWorkItemsFactor > 1)
+            // the QPU index is the one of the chunk of work-items, which the local IDs can't tell without the chunk size
+            throw CompilationError(CompilationStep::OPTIMIZER,
+                "Barrier inserted into a SIMT kernel looping over the chunks of its work-group", it->to_string());
         explicitIndexAndCount = insertWorkItemLoopQPUIndexAndCount(method, it);
+    }
     /*
      * "All work-items in a work-group executing the kernel on a processor must execute this function
      *  before any are allowed to continue execution beyond the barrier."
