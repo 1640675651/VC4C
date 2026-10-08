@@ -34,8 +34,9 @@ static const std::string WORK_ITEM_LOOP_BARRIER_FUNCTION = "vc4cl_work_item_loop
 
 // The maximum number of work-items per QPU: one per lane of the vector registers keeping their values
 static constexpr uint32_t MAX_WORK_ITEMS_PER_QPU = NATIVE_VECTOR_SIZE;
-// The maximum number of values kept per work-item across a barrier, i.e. of vector registers used for them
-static constexpr std::size_t MAX_CONTEXT_VALUES = 16;
+// The maximum number of values kept per work-item across barriers in registers, i.e. of vector registers used for
+// them. The other values are kept in the work-items' stack frames in RAM.
+static constexpr std::size_t MAX_REGISTER_CONTEXTS = 16;
 
 static bool isWorkItemLoopsEnabled(const Configuration& config)
 {
@@ -267,8 +268,6 @@ struct BarrierInfo
 
 static std::string checkKernel(Method& method, std::vector<BarrierInfo>& barriers)
 {
-    if(!method.stackAllocations.empty())
-        return "uses private arrays (stack allocations)";
     if(method.metaData.mergedWorkItemsFactor > 1)
         return "runs in SIMT mode";
 
@@ -352,14 +351,12 @@ static std::string checkKernel(Method& method, std::vector<BarrierInfo>& barrier
             }
             if(readByBarrier && !readOtherwise)
                 continue;
-            if(!loc->type.isScalarType() && !loc->type.getPointerType())
-                return "keeps the non-scalar value " + loc->to_string() + " across a barrier";
+            if(!loc->type.isScalarType() && !loc->type.isVectorType() && !loc->type.getPointerType())
+                return "keeps the value " + loc->to_string() + " across a barrier";
             if(loc->type.getScalarBitCount() > 32)
                 return "keeps the 64-bit value " + loc->to_string() + " across a barrier";
             info.contextValues.push_back(loc);
         }
-        if(info.contextValues.size() > MAX_CONTEXT_VALUES)
-            return "keeps too many values across a barrier (" + std::to_string(info.contextValues.size()) + ")";
         // deterministic order
         std::sort(info.contextValues.begin(), info.contextValues.end(),
             [](const Local* a, const Local* b) { return a->name < b->name; });
@@ -467,17 +464,94 @@ static void insertLoopStart(InstructionWalker& it, const LoopState& state)
     assign(it, state.lane) = INT_ZERO;
 }
 
+/*
+ * Where the value of a work-item is kept between the regions: in its lane of a vector register (for up to
+ * MAX_REGISTER_CONTEXTS scalars), or in a private variable (stack allocation) in the work-item's stack frame in RAM.
+ */
+struct Context
+{
+    // the vector register, lane k for the k-th work-item of the QPU
+    Value vector = UNDEFINED_VALUE;
+    // the private variable and the type stored in it
+    const StackAllocation* variable = nullptr;
+    DataType storageType = TYPE_UNKNOWN;
+};
+
+// The type the value is stored as in memory: all the bits of its 32-bit registers (e.g. also for 8-bit and boolean
+// values)
+static DataType getStorageType(const DataType& type)
+{
+    if(type.getPointerType())
+        return TYPE_INT32;
+    if(type.getScalarBitCount() <= 32)
+        return TYPE_INT32.toVectorType(type.getVectorWidth());
+    return type;
+}
+
+/*
+ * Determines where to keep the values: the scalars kept across the most barriers in registers, all others in memory.
+ */
+static FastMap<const Local*, Context> createContexts(Method& method, const std::vector<BarrierInfo>& barriers)
+{
+    FastMap<const Local*, std::size_t> numBarriers;
+    for(const auto& barrier : barriers)
+    {
+        for(auto loc : barrier.contextValues)
+            ++numBarriers[loc];
+    }
+    std::vector<const Local*> values;
+    for(const auto& entry : numBarriers)
+        values.push_back(entry.first);
+    std::sort(values.begin(), values.end(), [&](const Local* a, const Local* b) {
+        auto countA = numBarriers.at(a);
+        auto countB = numBarriers.at(b);
+        return countA > countB || (countA == countB && a->name < b->name);
+    });
+    FastMap<const Local*, Context> contexts;
+    std::size_t numRegisters = 0;
+    for(auto loc : values)
+    {
+        Context context;
+        if(numRegisters < MAX_REGISTER_CONTEXTS && (loc->type.isScalarType() || loc->type.getPointerType()))
+        {
+            context.vector = method.addNewLocal(TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE), "%work_item_loop_context");
+            ++numRegisters;
+        }
+        else
+        {
+            context.storageType = getStorageType(loc->type);
+            auto name = "%work_item_loop_context." + (loc->name.find('%') == 0 ? loc->name.substr(1) : loc->name);
+            auto pos = method.stackAllocations.emplace(StackAllocation(name,
+                method.createPointerType(context.storageType, AddressSpace::PRIVATE),
+                context.storageType.getInMemoryWidth(), context.storageType.getInMemoryAlignment()));
+            context.variable = &*pos.first;
+        }
+        contexts.emplace(loc, context);
+    }
+    return contexts;
+}
+
 // Restores the local IDs and the given values of the current work-item
 static void insertRestore(Method& method, InstructionWalker& it, const LoopState& state,
-    const std::vector<const Local*>& values, const FastMap<const Local*, Value>& contexts)
+    const std::vector<const Local*>& values, const FastMap<const Local*, Context>& contexts)
 {
     auto ids = method.addNewLocal(TYPE_INT32, "%work_item_loop_local_ids");
     it = insertVectorExtraction(it, method, state.localIds, state.lane, ids);
     it = insertReplication(it, ids, state.currentLocalIds->createReference());
     for(auto loc : values)
     {
+        const auto& context = contexts.at(loc);
+        if(context.variable)
+        {
+            auto tmp = method.addNewLocal(context.storageType, "%work_item_loop_restore");
+            it.emplace(std::make_unique<MemoryInstruction>(
+                MemoryOperation::READ, Value(tmp), context.variable->createReference()));
+            it.nextInBlock();
+            assign(it, loc->createReference()) = tmp;
+            continue;
+        }
         auto tmp = method.addNewLocal(TYPE_INT32, "%work_item_loop_restore");
-        it = insertVectorExtraction(it, method, contexts.at(loc), state.lane, tmp);
+        it = insertVectorExtraction(it, method, context.vector, state.lane, tmp);
         auto replicated = method.addNewLocal(TYPE_INT32, "%work_item_loop_restore");
         it = insertReplication(it, tmp, replicated);
         assign(it, loc->createReference()) = replicated;
@@ -486,15 +560,25 @@ static void insertRestore(Method& method, InstructionWalker& it, const LoopState
 
 // Saves the given values of the current work-item and advances to the next work-item
 static void insertSaveAndAdvance(Method& method, InstructionWalker& it, const LoopState& state,
-    const std::vector<const Local*>& values, const FastMap<const Local*, Value>& contexts)
+    const std::vector<const Local*>& values, const FastMap<const Local*, Context>& contexts)
 {
     // The saves use a copy of the lane, since VC4C may move the increment of the lane (a local written several times)
     // above earlier reads of it
     auto lane = assign(it, TYPE_INT32, "%work_item_loop_current_lane") = state.lane;
     for(auto loc : values)
     {
+        const auto& context = contexts.at(loc);
+        if(context.variable)
+        {
+            // the stack frame is the one of the current work-item (the linear ID is advanced below)
+            auto tmp = assign(it, context.storageType, "%work_item_loop_save") = loc->createReference();
+            it.emplace(std::make_unique<MemoryInstruction>(
+                MemoryOperation::WRITE, context.variable->createReference(), std::move(tmp)));
+            it.nextInBlock();
+            continue;
+        }
         auto tmp = assign(it, TYPE_INT32, "%work_item_loop_save") = loc->createReference();
-        it = insertVectorInsertion(it, method, contexts.at(loc), lane, tmp);
+        it = insertVectorInsertion(it, method, context.vector, lane, tmp);
     }
     auto nextLinearId = assign(it, TYPE_INT32, "%work_item_loop_next_linear_id") = state.linearId + state.numQPUs;
     auto nextLane = assign(it, TYPE_INT32, "%work_item_loop_next_lane") = lane + INT_ONE;
@@ -565,7 +649,7 @@ static std::vector<std::vector<std::size_t>> determineRegionEnds(Method& method,
  * label.
  */
 static void insertRegionEnd(Method& method, InstructionWalker& it, const LoopState& state,
-    const std::vector<const Local*>& values, const FastMap<const Local*, Value>& contexts,
+    const std::vector<const Local*>& values, const FastMap<const Local*, Context>& contexts,
     const std::vector<std::size_t>& regions, const std::vector<const Local*>& headers, const Value& currentRegion,
     const Local* exitLabel)
 {
@@ -609,16 +693,7 @@ static void insertRegionEnd(Method& method, InstructionWalker& it, const LoopSta
 
 static void convertToWorkItemLoops(Method& method, const std::vector<BarrierInfo>& barriers)
 {
-    const auto contextType = TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE);
-    FastMap<const Local*, Value> contexts;
-    for(const auto& barrier : barriers)
-    {
-        for(auto loc : barrier.contextValues)
-        {
-            if(contexts.find(loc) == contexts.end())
-                contexts.emplace(loc, method.addNewLocal(contextType, "%work_item_loop_context"));
-        }
-    }
+    auto contexts = createContexts(method, barriers);
     // determined before changing the control flow
     auto regionEnds = determineRegionEnds(method, barriers);
     std::vector<const Local*> headers;
@@ -631,8 +706,11 @@ static void convertToWorkItemLoops(Method& method, const std::vector<BarrierInfo
     auto it = method.begin()->walk().nextInBlock();
     auto state = insertLoopSetup(method, it);
     for(const auto& context : contexts)
-        // the lanes are only read after being written, but the registers are initialized as a whole
-        assign(it, context.second) = INT_ZERO;
+    {
+        if(!context.second.variable)
+            // the lanes are only read after being written, but the registers are initialized as a whole
+            assign(it, context.second.vector) = INT_ZERO;
+    }
     insertLoopStart(it, state);
     it = method.emplaceLabel(it, std::make_unique<BranchLabel>(*headers[0]));
     it.nextInBlock();
@@ -683,6 +761,8 @@ static void convertToWorkItemLoops(Method& method, const std::vector<BarrierInfo
     it.emplace(std::make_unique<Return>());
 
     method.metaData.workItemLoopLocalIds = state.currentLocalIds;
+    // private memory (also of the values kept in memory) is per work-item
+    method.metaData.workItemLoopFrameIndex = state.linearId.local();
 }
 
 void normalization::loopWorkItems(Module& module, Method& method, const Configuration& config)

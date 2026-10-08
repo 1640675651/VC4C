@@ -35,10 +35,10 @@ namespace vc4c
          * region then ends at the next barrier reached, and the loop over the work-items continues with the region
          * the QPU is in.
          *
-         * Supported are kernels without private arrays (stack allocations), with at most 16 such values per barrier,
-         * all of them scalars of at most 32 bits or pointers, not calling work-group functions with their own
-         * barriers (e.g. async_work_group_copy). Other kernels are not changed and keep the limit of one work-item per
-         * QPU.
+         * Up to 16 such values (scalars of at most 32 bits or pointers) are kept in registers, all others (also
+         * vectors) in a private variable in the work-item's stack frame in RAM. Private memory (stack allocations) is
+         * per work-item: every work-item has its own stack frame. Kernels keeping 64-bit values across barriers are
+         * not changed and keep the limit of one work-item per QPU.
          *
          * NOTE: Needs to run before the work-item functions and barriers are intrinsified.
          */

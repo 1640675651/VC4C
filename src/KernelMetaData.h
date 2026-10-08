@@ -47,6 +47,12 @@ namespace vc4c
          */
         const Local* workItemLoopLocalIds = nullptr;
         /**
+         * For kernels looping over the work-items of their QPU: the local holding the index of the stack frame of the
+         * current work-item (in SIMT mode: of the current chunk of work-items), which the stack allocations use
+         * instead of the QPU number. NULL for other kernels.
+         */
+        const Local* workItemLoopFrameIndex = nullptr;
+        /**
          * The meta data strings to be stored in the module and used by the run-time for CL_KERNEL_ATTRIBUTES queries.
          */
         std::vector<MetaData> entries;

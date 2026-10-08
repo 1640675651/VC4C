@@ -130,8 +130,13 @@ void normalization::resolveStackAllocation(
                 CPPLOG_LAZY(logging::Level::DEBUG,
                     log << "Replacing access to stack allocated data: " << it->to_string() << logging::endl);
 
-                auto qpuOffset = assign(it, TYPE_INT32, "%stack_offset") = mul24(Value(REG_QPU_NUMBER, TYPE_INT8),
-                    Value(Literal(static_cast<uint32_t>(maximumStackSize)), TYPE_INT32));
+                // Kernels looping over the work-items of their QPUs have a stack frame per work-item (see
+                // normalization/WorkItemLoops.cpp)
+                auto frameIndex = method.metaData.workItemLoopFrameIndex ?
+                    method.metaData.workItemLoopFrameIndex->createReference() :
+                    Value(REG_QPU_NUMBER, TYPE_INT8);
+                auto qpuOffset = assign(it, TYPE_INT32, "%stack_offset") =
+                    mul24(frameIndex, Value(Literal(static_cast<uint32_t>(maximumStackSize)), TYPE_INT32));
                 auto addrTemp = assign(it, arg.type, "%stack_addr") =
                     qpuOffset + method.findOrCreateBuiltin(BuiltinLocal::Type::GLOBAL_DATA_ADDRESS)->createReference();
                 auto finalAddr = assign(it, arg.type, "%stack_addr") = addrTemp +

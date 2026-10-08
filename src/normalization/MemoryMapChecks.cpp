@@ -1121,6 +1121,20 @@ MemoryAccessInfo normalization::determineMemoryAccess(Method& method)
         }
     }
 
+    if(method.metaData.workItemLoopFrameIndex)
+    {
+        // The QPUs loop over their work-items (see normalization/WorkItemLoops.cpp), so private memory is needed per
+        // work-item, i.e. in the per-work-item stack frames in RAM, not in a register of the QPU
+        for(auto& entry : mapping)
+        {
+            if(entry.first->is<StackAllocation>())
+            {
+                entry.second.preferred = MemoryAccessType::RAM_READ_WRITE_VPM;
+                entry.second.fallback = MemoryAccessType::RAM_READ_WRITE_VPM;
+            }
+        }
+    }
+
     // 2. map memory access instructions to phi-nodes, determine best common access type
     for(const auto& conditionalAccessedMemory : conditionalWrittenMemoryAccesses)
     {
