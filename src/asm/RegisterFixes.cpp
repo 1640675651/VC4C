@@ -212,7 +212,9 @@ FixupResult qpu_asm::groupParameters(Method& method, const Configuration& config
             readerIt = intermediate::insertVectorExtraction(
                 readerIt, method, tmpGroup, Value(SmallImmediate(groupIndex), TYPE_INT8), tmp);
             readerIt->replaceLocal(*paramIt, tmp);
-            if(isUsedAsSplatValue(tmp.local()))
+            // In SIMT mode, (scalar) parameters are combined with the values of the work-items in all lanes, e.g. the
+            // base address with the per-lane offsets
+            if(method.metaData.mergedWorkItemsFactor > 1 || isUsedAsSplatValue(tmp.local()))
             {
                 // we need to recreate the splat property by replicating the value
                 auto splatTmp = method.addNewLocal((*paramIt)->type, (*paramIt)->name);
@@ -439,7 +441,8 @@ FixupResult qpu_asm::groupScalarLocals(
                 // insert a NOP before the  actually reading instruction to allow for e.g. unpack-modes
                 nop(reader, intermediate::DelayType::WAIT_REGISTER);
             reader->replaceLocal(entry.first, tmpValue);
-            if(isUsedAsSplatValue(tmpValue.local()))
+            // In SIMT mode, uniform values are combined with the values of the work-items in all lanes
+            if(method.metaData.mergedWorkItemsFactor > 1 || isUsedAsSplatValue(tmpValue.local()))
             {
                 // we need to recreate the splat property by replicating the value
                 auto splatTmp = method.addNewLocal(entry.first->type, entry.first->name);
