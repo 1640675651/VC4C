@@ -592,6 +592,11 @@ and on the compiler being correct in both modes (see step 1).
     optimizer) then used the spill's flags, and elements were zeroed. Now the spill code goes to the
     first position where the flags are dead, and the local isn't spilled if there is none in the
     block.
+- **Register allocation still fails for some compilations** of large kernels ("There are erroneous
+  register-associations!", e.g. 1 in 3 compilations of CLBlast's GEMM program). Since a whole OpenCL
+  program fails to build if one kernel fails, VC4C now retries the whole compilation up to 3 times
+  after such an error (`Compiler::compile`), which usually succeeds. The allocation itself is not
+  fixed.
 
   Found by comparing the binaries of repeated compilations (all different) on the GPU, each run
   several times against a reference output: a wrong binary fails every time. Verified with 60
@@ -748,11 +753,25 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
 
 ### 4. Memory accesses
 
-- **Non-contiguous loads** (`p[idx[gid]]`, `p[2 * gid]`, transposes): the TMU accepts a separate
-  address per lane (VC4C's `customAddressCalculation`). Inactive lanes need a safe address (e.g. the
-  address of an active lane), since TMU requests can't be masked.
-- **Non-contiguous stores:** one single-word DMA per active lane, as the masked store loop already
-  does; faster variants for strided patterns (VDW with a memory stride).
+- **Done (2026-10-08): non-contiguous loads and stores** of 32-bit elements (`p[idx[gid]]`,
+  `p[3 * gid]`, transposes through `__local` memory) in scalar kernels: such an access is run lane by
+  lane (`insertScatteredAccess`), each active lane loading or storing its single element at its own
+  address (the per-lane value of the pointer), via the TMU for read-only memory, otherwise via DMA.
+  The active lanes are those of the block's mask in divergent code, else those in the work-group:
+  the other lanes may have any address, which must not be accessed. Verified with a transpose
+  through `__local` memory (tiles of 1 × 1 to 13 × 13), a gather with computed indices, strided
+  loads and stores of the same buffer, and a permuting store inside a bounds check, in the emulator
+  and on the GPU. Up to 16 accesses per lane loop, so this is much slower than a contiguous access.
+  The per-lane addresses are calculated as a vector of 16 addresses next to the (scalar) pointer:
+  with the scalar pointer, VC4C's instruction combining (`--fcombine`) treated the address as the
+  same in all lanes and some compilations of CLBlast's `TransposePadMatrix` read the wrong tile
+  elements (found by testing 6 binaries of the same source 3 times each: the wrong binaries failed
+  every time). Then CLBlast's transposing and padding kernels (`TransposeMatrix`,
+  `TransposePadMatrix`) run in SIMT mode, and its SGEMM test passes all 234 cases.
+- Faster non-contiguous accesses: a TMU load with a separate address per lane (VC4C's
+  `customAddressCalculation`, inactive lanes need a safe address, since TMU requests can't be
+  masked), and strided stores by a single VDW with a memory stride.
+- 8- and 16-bit elements at non-contiguous addresses.
 - **Addresses changing in divergent loops:** use per-lane addresses (above) instead of lane 0's.
 - **8- and 16-bit stores in divergent code**, 64-bit types, private arrays (one stack frame per
   lane), atomics (serialize the active lanes).
@@ -763,9 +782,15 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
 
 - **Computed branches** (`switch` lowered to a jump table) in divergent code: convert to a chain of
   conditional edges, or handle as a multi-way edge in the region linearization.
-- **Irregular control flow** (regions not laid out between their entry and merge point, loops
-  entered in the middle, overlapping regions): reorder blocks before linearizing, or fall back as
-  today.
+- **Done (2026-10-08): blocks not laid out between the entry and merge point of their region.**
+  Clang sometimes places e.g. the body of an `if` after the following block, which looked like a loop
+  entered in the middle (CLBlast's `CopyMatrix`, `CopyPadMatrix` and `XgemmDirect`). If the
+  divergent regions aren't supported, the SIMT pass lays the blocks out in a topological order of the
+  forward edges which keeps every loop's blocks together (`reorderBlocks`, for single-entry loops
+  only) and checks them again. If the kernel is still not converted, the original order is restored.
+  Then CLBlast's `CopyMatrix` and `CopyPadMatrix` run in SIMT mode. (`XgemmDirect` with the current
+  parameters has a barrier in a region found divergent and stays in classic mode.)
+- **Irregular control flow** (loops entered in the middle, overlapping regions): fall back as today.
 - **Packing rows of narrow work-groups:** multi-dimensional work-groups work, but a chunk is one row
   in x, so a local size in x below 16 wastes lanes. Several rows per chunk need per-lane local IDs in
   x, y and z (VC4CL passes the chunk's first local ID; the lane's ID needs to be unflattened), and
