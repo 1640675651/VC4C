@@ -6,6 +6,8 @@
 
 #include "KernelInfo.h"
 
+#include "../normalization/WorkItemLoops.h"
+
 #include "../GlobalValues.h"
 #include "../Method.h"
 #include "../Module.h"
@@ -304,7 +306,8 @@ KernelHeader qpu_asm::createKernelHeader(
         if(auto ptrType = global.type.getPointerType())
         {
             if(ptrType->addressSpace == AddressSpace::LOCAL)
-                localBufferSize += ptrType->elementType.getInMemoryWidth();
+                // as placed into the copy per team of QPUs, see normalization/WorkItemLoops.cpp
+                localBufferSize += normalization::getLocalVariableSize(global);
             else if(ptrType->addressSpace == AddressSpace::PRIVATE)
                 privateBufferSize += ptrType->elementType.getInMemoryWidth();
         }

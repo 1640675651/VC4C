@@ -838,6 +838,102 @@ InstructionWalker intrinsics::intrinsifyBarrier(Method& method, TypedInstruction
     return origIt.nextInBlock();
 }
 
+// The maximum number of teams of QPUs running work-groups at the same time with barriers, two semaphores each
+static constexpr unsigned MAX_BARRIER_TEAMS = 6;
+
+/*
+ * Barrier between the QPUs of a team (running one work-group, while other teams run other work-groups), with the
+ * semaphores 2 * team and 2 * team + 1 of the team:
+ *
+ *   QPU 0 of the team: decrement semaphore 2t (count - 1) times, then increment semaphore 2t + 1 (count - 1) times
+ *   the other QPUs: increment semaphore 2t, decrement semaphore 2t + 1
+ *
+ * So QPU 0 waits for all others to arrive and then releases them. The semaphore numbers are immediates, so the code
+ * branches to a copy for the team's semaphores.
+ */
+static InstructionWalker lowerTeamBarrier(
+    Method& method, InstructionWalker it, const Value& index, const Value& count, const Value& team)
+{
+    auto beforeIt = it.copy().previousInBlock();
+    auto afterLabel = method.addNewLocal(TYPE_LABEL, "%team_barrier_after").local();
+    std::vector<const Local*> otherLabels;
+    std::vector<const Local*> leaderLabels;
+    for(unsigned t = 0; t < MAX_BARRIER_TEAMS; ++t)
+    {
+        otherLabels.push_back(method.addNewLocal(TYPE_LABEL, "%team_barrier_other").local());
+        leaderLabels.push_back(method.addNewLocal(TYPE_LABEL, "%team_barrier_leader").local());
+    }
+    // the blocks (empty for now) and the rest of the original block after them
+    it = it.erase();
+    std::vector<BasicBlock*> otherBlocks;
+    std::vector<BasicBlock*> leaderBlocks;
+    for(unsigned t = 0; t < MAX_BARRIER_TEAMS; ++t)
+    {
+        it = method.emplaceLabel(it, std::make_unique<BranchLabel>(*otherLabels[t]));
+        otherBlocks.push_back(it.getBasicBlock());
+        it.nextInBlock();
+        it = method.emplaceLabel(it, std::make_unique<BranchLabel>(*leaderLabels[t]));
+        leaderBlocks.push_back(it.getBasicBlock());
+        it.nextInBlock();
+    }
+    it = method.emplaceLabel(it, std::make_unique<BranchLabel>(*afterLabel));
+    auto afterIt = it.copy().nextInBlock();
+
+    // the dispatch: key = 2 * team + (index != 0), no barrier for a single QPU
+    auto dispatchIt = beforeIt.nextInBlock();
+    auto isOther = assign(dispatchIt, TYPE_INT32, "%team_barrier_key") = min(as_signed{index}, as_signed{INT_ONE});
+    auto teamTimesTwo = assign(dispatchIt, TYPE_INT32, "%team_barrier_key") = team << 1_val;
+    auto key = assign(dispatchIt, TYPE_INT32, "%team_barrier_key") = teamTimesTwo + isOther;
+    auto target = method.addNewLocal(TYPE_CODE_ADDRESS, "%team_barrier_switch");
+    dispatchIt.emplace(std::make_unique<CodeAddress>(target, afterLabel));
+    dispatchIt.nextInBlock();
+    for(unsigned t = 0; t < MAX_BARRIER_TEAMS; ++t)
+    {
+        for(unsigned other = 0; other < 2; ++other)
+        {
+            auto cond = assignNop(dispatchIt) =
+                as_unsigned{key} == as_unsigned{Value(Literal(2 * t + other), TYPE_INT32)};
+            dispatchIt.emplace(
+                std::make_unique<CodeAddress>(target, other ? otherLabels[t] : leaderLabels[t], cond));
+            dispatchIt.nextInBlock();
+        }
+    }
+    auto single = assignNop(dispatchIt) = as_unsigned{count} == as_unsigned{INT_ONE};
+    dispatchIt.emplace(std::make_unique<CodeAddress>(target, afterLabel, single));
+    dispatchIt.nextInBlock();
+    dispatchIt.emplace(std::make_unique<Branch>(target.local()));
+
+    for(unsigned t = 0; t < MAX_BARRIER_TEAMS; ++t)
+    {
+        auto arrived = static_cast<Semaphore>(2 * t);
+        auto released = static_cast<Semaphore>(2 * t + 1);
+        {
+            auto otherIt = otherBlocks[t]->walkEnd();
+            otherIt.emplace(std::make_unique<SemaphoreAdjustment>(arrived, true));
+            otherIt.nextInBlock();
+            otherIt.emplace(std::make_unique<SemaphoreAdjustment>(released, false));
+            otherIt.nextInBlock();
+            otherIt.emplace(std::make_unique<Branch>(afterLabel));
+        }
+        {
+            auto leaderIt = leaderBlocks[t]->walkEnd();
+            for(bool release : {false, true})
+            {
+                auto counter = assign(leaderIt, TYPE_INT32, "%team_barrier_counter") =
+                    (count - INT_ONE, InstructionDecorations::PHI_NODE);
+                auto& loopBlock = insertLoop(method, leaderIt, counter, "%team_barrier_loop");
+                auto loopIt = loopBlock.walk().nextInBlock();
+                loopIt.emplace(std::make_unique<SemaphoreAdjustment>(release ? released : arrived, release));
+                loopIt.nextInBlock();
+                assign(loopIt, counter) = (counter - INT_ONE, InstructionDecorations::PHI_NODE);
+                leaderIt.nextInBlock();
+            }
+            leaderIt.emplace(std::make_unique<Branch>(afterLabel));
+        }
+    }
+    return afterIt;
+}
+
 InstructionWalker intrinsics::intrinsifyWorkItemLoopBarrier(
     Method& method, TypedInstructionWalker<intermediate::MethodCall> inIt)
 {
@@ -847,6 +943,9 @@ InstructionWalker intrinsics::intrinsifyWorkItemLoopBarrier(
         log << "Intrinsifying barrier between the QPUs of a work-group: " << callSite.to_string() << logging::endl);
     auto index = callSite.assertArgument(0);
     auto count = callSite.assertArgument(1);
+    if(auto team = callSite.getArgument(2))
+        // the QPUs of a team running a work-group, while other teams run other work-groups
+        return lowerTeamBarrier(method, it, index, count, *team);
     auto origIt = it.copy().previousInBlock();
     lowerBarrier(method, it, {}, std::make_pair(index, count));
     return origIt.nextInBlock();

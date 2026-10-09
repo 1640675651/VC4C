@@ -356,7 +356,16 @@ static std::string checkKernel(Method& method, std::vector<BarrierInfo>& barrier
             if(!loc->type.isScalarType() && !loc->type.isVectorType() && !loc->type.getPointerType())
                 return "keeps the value " + loc->to_string() + " across a barrier";
             if(loc->type.getScalarBitCount() > 32)
-                return "keeps the 64-bit value " + loc->to_string() + " across a barrier";
+            {
+                // 64-bit values are kept as their lower and upper 32-bit words, which the 64-bit operations are
+                // rewritten to use later (see normalization/LongOperations.cpp)
+                auto parts = loc->get<MultiRegisterData>();
+                if(!parts)
+                    return "keeps the 64-bit value " + loc->to_string() + " across a barrier";
+                info.contextValues.push_back(parts->lower);
+                info.contextValues.push_back(parts->upper);
+                continue;
+            }
             info.contextValues.push_back(loc);
         }
         // deterministic order
@@ -403,6 +412,11 @@ struct LoopState
     Value lane = UNDEFINED_VALUE;
     Value localIds = UNDEFINED_VALUE;
     const Local* currentLocalIds = nullptr;
+    // with teams of QPUs running different work-groups at the same time: the QPU's team, the index of the current
+    // work-item's stack frame (the team's frames follow each other) and the index of the team's first frame
+    Optional<Value> team;
+    Value frameIndex = UNDEFINED_VALUE;
+    Value teamFrameOffset = UNDEFINED_VALUE;
 };
 
 static LoopState insertLoopSetup(Method& method, InstructionWalker& it, uint8_t chunkWidth)
@@ -485,6 +499,8 @@ static void insertLoopStart(InstructionWalker& it, const LoopState& state)
 {
     assign(it, state.linearId) = state.qpuIndex;
     assign(it, state.lane) = INT_ZERO;
+    if(state.team)
+        assign(it, state.frameIndex) = state.teamFrameOffset + state.qpuIndex;
 }
 
 /*
@@ -619,6 +635,8 @@ static void insertSaveAndAdvance(Method& method, InstructionWalker& it, const Lo
     auto nextLane = assign(it, TYPE_INT32, "%work_item_loop_next_lane") = lane + INT_ONE;
     assign(it, state.linearId) = nextLinearId;
     assign(it, state.lane) = nextLane;
+    if(state.team)
+        assign(it, state.frameIndex) = state.teamFrameOffset + nextLinearId;
 }
 
 static const Local* createLabel(Method& method, const std::string& name)
@@ -726,6 +744,100 @@ static void insertRegionEnd(Method& method, InstructionWalker& it, const LoopSta
     it.nextInBlock();
 }
 
+static std::vector<Value> getBarrierArguments(const LoopState& state)
+{
+    if(state.team)
+        return std::vector<Value>{state.qpuIndex, state.numQPUs, *state.team};
+    return std::vector<Value>{state.qpuIndex, state.numQPUs};
+}
+
+const Parameter* normalization::findHiddenParameter(const Method& method, const std::string& name)
+{
+    for(const auto& param : method.parameters)
+    {
+        if(param.name == "%" + name)
+            return &param;
+    }
+    return nullptr;
+}
+
+static const Parameter& addHiddenParameter(Method& method, const std::string& name, DataType type)
+{
+    // the parameters are referred to by pointer, so they must not move, see BitcodeReader::parseFunction
+    if(method.parameters.size() >= method.parameters.capacity())
+        throw CompilationError(CompilationStep::NORMALIZER, "Cannot add hidden parameter to kernel", method.name);
+    return method.addParameter(Parameter("%" + name, type, ParameterDecorations::INPUT));
+}
+
+/*
+ * Several work-groups run at the same time on teams of QPUs (in SIMT mode, where a work-group often has fewer chunks
+ * of work-items than there are QPUs), each team looping over its work-groups. The team is a hidden parameter, which
+ * selects the team's stack frames and semaphores. The kernel's __local variables are per team too: they are placed
+ * in a hidden __local parameter, the run-time passes every team its own copy.
+ */
+static void insertTeams(Method& method, InstructionWalker& it, LoopState& state)
+{
+    const auto& teamParam = addHiddenParameter(method, WORK_GROUP_TEAM_PARAMETER_NAME, TYPE_INT32);
+    state.team = teamParam.createReference();
+    state.teamFrameOffset = assign(it, TYPE_INT32, "%work_item_loop_team_frames") = mul24(*state.team, state.groupSize);
+    state.frameIndex = method.addNewLocal(TYPE_INT32, "%work_item_loop_frame_index");
+
+    // the __local variables (globals in the __local address space) used by the kernel, in a deterministic order
+    std::vector<const Global*> localVariables;
+    for(const auto& block : method)
+    {
+        for(const auto& instr : block)
+        {
+            if(!instr)
+                continue;
+            instr->forUsedLocals([&](const Local* loc, LocalUse::Type, const IntermediateInstruction&) {
+                auto global = loc->as<Global>();
+                auto ptrType = loc->type.getPointerType();
+                if(global && ptrType && ptrType->addressSpace == AddressSpace::LOCAL &&
+                    std::find(localVariables.begin(), localVariables.end(), global) == localVariables.end())
+                    localVariables.push_back(global);
+            });
+        }
+    }
+    if(localVariables.empty())
+        return;
+    std::sort(localVariables.begin(), localVariables.end(),
+        [](const Global* a, const Global* b) -> bool { return a->name < b->name; });
+    const auto& localParam = addHiddenParameter(method, LOCAL_VARIABLES_PARAMETER_NAME,
+        method.createPointerType(TYPE_INT8, AddressSpace::LOCAL, LOCAL_VARIABLE_ALIGNMENT));
+    uint32_t offset = 0;
+    for(auto global : localVariables)
+    {
+        auto address = assign(it, global->type, global->name.substr(1)) =
+            localParam.createReference() + Value(Literal(offset), TYPE_INT32);
+        offset += getLocalVariableSize(*global);
+        for(auto& block : method)
+        {
+            for(auto instrIt = block.walk(); !instrIt.isEndOfBlock(); instrIt.nextInBlock())
+            {
+                if(!instrIt.has() || instrIt.get() == address.local()->getSingleWriter())
+                    continue;
+                if(instrIt->readsLocal(global))
+                    instrIt->replaceLocal(global, address.local(), LocalUse::Type::READER);
+                // pointers into the variable refer to the parameter now, e.g. for the memory access analysis
+                instrIt->forUsedLocals([&](const Local* loc, LocalUse::Type, const IntermediateInstruction&) {
+                    auto ref = loc->get<ReferenceData>();
+                    if(ref && ref->base == global)
+                        const_cast<Local*>(loc)->set(ReferenceData(localParam, ANY_ELEMENT));
+                });
+            }
+        }
+        address.local()->set(ReferenceData(localParam, ANY_ELEMENT));
+    }
+}
+
+uint32_t normalization::getLocalVariableSize(const Global& global)
+{
+    // every variable starts at a multiple of the alignment, see insertTeams
+    auto size = global.type.getElementType().getInMemoryWidth();
+    return (size + LOCAL_VARIABLE_ALIGNMENT - 1) / LOCAL_VARIABLE_ALIGNMENT * LOCAL_VARIABLE_ALIGNMENT;
+}
+
 static void convertToWorkItemLoops(Method& method, const std::vector<BarrierInfo>& barriers)
 {
     auto contexts = createContexts(method, barriers);
@@ -741,6 +853,8 @@ static void convertToWorkItemLoops(Method& method, const std::vector<BarrierInfo
     auto chunkWidth = std::max(method.metaData.mergedWorkItemsFactor, uint8_t{1});
     auto it = method.begin()->walk().nextInBlock();
     auto state = insertLoopSetup(method, it, chunkWidth);
+    if(method.metaData.mergedWorkItemsFactor > 1)
+        insertTeams(method, it, state);
     if(auto uniformIds = method.findBuiltin(BuiltinLocal::Type::LOCAL_IDS))
     {
         // In SIMT mode, the kernel reads the local IDs of the QPU's first work-item (e.g. for the lanes active in the
@@ -779,8 +893,7 @@ static void convertToWorkItemLoops(Method& method, const std::vector<BarrierInfo
         it = method.emplaceLabel(it, std::make_unique<BranchLabel>(*syncLabel));
         it.nextInBlock();
         // replace the barrier between the work-items with the one between the QPUs of the work-group
-        it.reset(std::make_unique<MethodCall>(
-            std::string(WORK_ITEM_LOOP_BARRIER_FUNCTION), std::vector<Value>{state.qpuIndex, state.numQPUs}));
+        it.reset(std::make_unique<MethodCall>(std::string(WORK_ITEM_LOOP_BARRIER_FUNCTION), getBarrierArguments(state)));
         it.nextInBlock();
         insertLoopStart(it, state);
         it = method.emplaceLabel(it, std::make_unique<BranchLabel>(*headers[i + 1]));
@@ -808,11 +921,18 @@ static void convertToWorkItemLoops(Method& method, const std::vector<BarrierInfo
     insertRegionEnd(method, it, state, {}, contexts, regionEnds[0], headers, currentRegion, exitLabel);
     it = method.emplaceLabel(it, std::make_unique<BranchLabel>(*exitLabel));
     it.nextInBlock();
+    if(state.team)
+    {
+        // the QPUs of a team continue with the next work-group (see the work-group loop) only after all of them
+        // finished the current one, which might still use the team's __local memory
+        it.emplace(std::make_unique<MethodCall>(std::string(WORK_ITEM_LOOP_BARRIER_FUNCTION), getBarrierArguments(state)));
+        it.nextInBlock();
+    }
     it.emplace(std::make_unique<Return>());
 
     method.metaData.workItemLoopLocalIds = state.currentLocalIds;
     // private memory (also of the values kept in memory) is per work-item
-    method.metaData.workItemLoopFrameIndex = state.linearId.local();
+    method.metaData.workItemLoopFrameIndex = state.team ? state.frameIndex.local() : state.linearId.local();
 }
 
 // Whether the local is only used as the (whole) address of loads and stores of its type, by life-time markers and by

@@ -6,6 +6,8 @@
 
 #include "ControlFlow.h"
 
+#include "../normalization/WorkItemLoops.h"
+
 #include "../InstructionWalker.h"
 #include "../Profiler.h"
 #include "../analysis/ControlFlowGraph.h"
@@ -1057,6 +1059,11 @@ std::size_t optimizations::addWorkGroupLoop(const Module& module, Method& method
 {
     if(method.walkAllInstructions().isEndOfMethod())
         return 0u;
+    if(method.metaData.workItemLoopLocalIds &&
+        normalization::findHiddenParameter(method, normalization::WORK_GROUP_TEAM_PARAMETER_NAME))
+        // the teams of QPUs loop over their work-groups like over independent chunks of work-items, see
+        // normalization/WorkItemLoops.cpp
+        return addIndependentWorkGroupLoop(method);
     if(method.metaData.workItemLoopLocalIds)
     {
         // XXX Kernels whose QPUs loop over their work-items (see normalization/WorkItemLoops.cpp) computed wrong results

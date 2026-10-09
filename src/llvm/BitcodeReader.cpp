@@ -693,12 +693,12 @@ Method& BitcodeReader::parseFunction(Module& module, const llvm::Function& func)
 #if LLVM_LIBRARY_VERSION >= 50
     // one more for the hidden printf buffer parameter, see normalization/Printf.cpp (adding it must not move the
     // other parameters, which instructions refer to)
-    method->parameters.reserve(func.arg_size() + 1);
+    method->parameters.reserve(func.arg_size() + 3);
     for(const llvm::Argument& arg : func.args())
 #else
     // one more for the hidden printf buffer parameter, see normalization/Printf.cpp (adding it must not move the
     // other parameters, which instructions refer to)
-    method->parameters.reserve(func.getArgumentList().size() + 1);
+    method->parameters.reserve(func.getArgumentList().size() + 3);
     for(const llvm::Argument& arg : func.getArgumentList())
 #endif
     {
