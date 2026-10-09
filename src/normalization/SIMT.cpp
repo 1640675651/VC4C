@@ -1049,46 +1049,109 @@ static bool isElementAccessRotation(const MoveOperation& rotation)
 }
 
 /*
- * Computes the per-lane addresses of a work-item dependent pointer as a vector of 16 addresses. The pointers themselves
- * stay scalars in SIMT mode (holding the per-lane addresses), but the code generation may treat scalars as the same in
- * all lanes, e.g. the register allocation fix-ups grouping scalars into the lanes of a register and replicating them
- * again. Supported are pointers computed by adding and subtracting offsets and by moves. If an instruction walker is
- * given, the calculation is inserted before it, else only checked. Returns an empty value if not supported.
+ * The per-lane addresses of work-item dependent pointers as vectors of 16 addresses. The pointers themselves stay
+ * scalars in SIMT mode (holding the per-lane addresses), but the code generation may treat scalars as the same in all
+ * lanes, e.g. the instruction combining or the register allocation fix-ups grouping scalars into the lanes of a
+ * register and replicating them again. So every pointer accessed lane by lane gets a "shadow" vector, written next to
+ * (and under the same condition as) every write of the pointer. Supported are pointers written by adding or
+ * subtracting offsets and by moves.
  */
-static Optional<Value> insertAddressVector(
-    Method* method, InstructionWalker* it, const Analysis& analysis, const Value& address, unsigned depth = 0)
+static bool isAddressVectorSupported(
+    const Analysis& analysis, const Value& address, FastSet<const Local*>& visited, unsigned depth = 0)
 {
-    if(!analysis.isVarying(address))
-        // the same in all lanes, combined with the vectors of offsets by the calculation
-        return address;
     auto loc = address.checkLocal();
-    auto writer = loc ? loc->getSingleWriter() : nullptr;
-    if(depth > 16 || !writer || writer->hasConditionalExecution() || writer->hasUnpackMode() || writer->hasPackMode())
-        return {};
-    if(auto move = dynamic_cast<const MoveOperation*>(writer))
+    if(!analysis.isVarying(address) || !address.type.getPointerType())
+        return true;
+    if(!visited.emplace(loc).second)
+        // already checked or being checked (pointers written in loops)
+        return true;
+    if(depth > 32)
+        return false;
+    for(const auto& user : loc->getUsers())
     {
-        if(move->getVectorRotation())
-            return {};
-        return insertAddressVector(method, it, analysis, move->getSource(), depth + 1);
+        if(!user.second.writesLocal())
+            continue;
+        auto writer = user.first;
+        if(dynamic_cast<const MemoryInstruction*>(writer))
+            // writes the memory the pointer points to, not the pointer
+            continue;
+        if(writer->hasUnpackMode() || writer->hasPackMode() || writer->doesSetFlag())
+            return false;
+        if(auto move = dynamic_cast<const MoveOperation*>(writer))
+        {
+            if(move->getVectorRotation() || !isAddressVectorSupported(analysis, move->getSource(), visited, depth + 1))
+                return false;
+            continue;
+        }
+        auto op = dynamic_cast<const Operation*>(writer);
+        if(!op || (op->op != OP_ADD && op->op != OP_SUB) || !op->getArgument(1) ||
+            !isAddressVectorSupported(analysis, op->assertArgument(0), visited, depth + 1) ||
+            !isAddressVectorSupported(analysis, op->assertArgument(1), visited, depth + 1))
+            return false;
     }
-    auto op = dynamic_cast<const Operation*>(writer);
-    if(!op || (op->op != OP_ADD && op->op != OP_SUB) || !op->getArgument(1))
-        return {};
-    // pointer operands are calculated recursively, the work-item dependent offsets become vectors with the conversion
-    auto resolve = [&](const Value& arg) -> Optional<Value> {
-        return arg.type.getPointerType() ? insertAddressVector(method, it, analysis, arg, depth + 1) : Optional<Value>{arg};
-    };
-    auto arg0 = resolve(op->assertArgument(0));
-    auto arg1 = resolve(op->assertArgument(1));
-    if(!arg0 || !arg1)
-        return {};
-    if(!method || !it)
-        return address;
-    auto result = method->addNewLocal(TYPE_INT32.toVectorType(SIMT_WIDTH), "%simt_lane_addresses");
-    it->emplace(std::make_unique<Operation>(op->op, Value(result), Value(*arg0), Value(*arg1)));
-    it->nextInBlock();
-    return result;
+    return true;
 }
+
+class AddressVectors
+{
+public:
+    explicit AddressVectors(Method& method, const Analysis& analysis) : method(method), analysis(analysis) {}
+
+    // The vector of addresses of the pointer, inserting its calculation next to the writes of the pointer
+    Value get(const Value& address)
+    {
+        auto loc = address.checkLocal();
+        if(!analysis.isVarying(address) || !address.type.getPointerType())
+            // the same in all lanes, or an offset (converted to a vector by the conversion)
+            return address;
+        auto shadowIt = shadows.find(loc);
+        if(shadowIt != shadows.end())
+            return shadowIt->second;
+        auto shadow = method.addNewLocal(TYPE_INT32.toVectorType(SIMT_WIDTH), "%simt_lane_addresses");
+        shadows.emplace(loc, shadow);
+        if(walkers.empty())
+        {
+            for(auto& block : method)
+            {
+                for(auto it = block.walk(); !it.isEndOfBlock(); it.nextInBlock())
+                {
+                    if(it.has())
+                        walkers.emplace(it.get(), it);
+                }
+            }
+        }
+        std::vector<const IntermediateInstruction*> writers;
+        for(const auto& user : loc->getUsers())
+        {
+            if(user.second.writesLocal() && !dynamic_cast<const MemoryInstruction*>(user.first))
+                writers.push_back(user.first);
+        }
+        for(auto writer : writers)
+        {
+            auto writerIt = walkers.at(writer);
+            std::unique_ptr<ExtendedInstruction> calculation;
+            if(auto move = dynamic_cast<const MoveOperation*>(writer))
+                calculation = std::make_unique<MoveOperation>(shadow, get(move->getSource()));
+            else
+            {
+                auto op = dynamic_cast<const Operation*>(writer);
+                calculation =
+                    std::make_unique<Operation>(op->op, shadow, get(op->assertArgument(0)), get(op->assertArgument(1)));
+            }
+            calculation->setCondition(dynamic_cast<const ExtendedInstruction*>(writer)->getCondition());
+            auto insertIt = writerIt.copy().nextInBlock();
+            insertIt.emplace(std::move(calculation));
+            walkers.emplace(insertIt.get(), insertIt);
+        }
+        return shadow;
+    }
+
+private:
+    Method& method;
+    const Analysis& analysis;
+    FastMap<const Local*, Value> shadows;
+    FastMap<const IntermediateInstruction*, InstructionWalker> walkers;
+};
 
 /*
  * Whether the work-items access their 32-bit elements at addresses which are not consecutive across the lanes (e.g.
@@ -1106,7 +1169,8 @@ static bool isScatteredAccess(const Analysis& analysis, const MemoryInstruction&
     if(!elementType.isScalarType() || elementType.getScalarBitCount() != 32)
         return false;
     auto stride = analysis.getStride(address);
-    return (!stride || *stride != 4) && insertAddressVector(nullptr, nullptr, analysis, address);
+    FastSet<const Local*> visited;
+    return (!stride || *stride != 4) && isAddressVectorSupported(analysis, address, visited);
 }
 
 static std::string checkVaryingValues(const Method& method, const Analysis& analysis, const ControlFlow& cf,
@@ -1273,6 +1337,7 @@ static void insertCompaction(Method& method, InstructionWalker& it, const Value&
 static void convertToSIMT(Method& method, const Analysis& analysis, uint8_t vectorWidth,
     FastMap<const IntermediateInstruction*, Value>& scatteredAccesses)
 {
+    AddressVectors addressVectors(method, analysis);
     const auto workItemsPerQPU = static_cast<uint8_t>(SIMT_WIDTH / vectorWidth);
     auto startIt = method.walkAllInstructions();
     if(!startIt.isEndOfMethod() && startIt.get<BranchLabel>())
@@ -1370,11 +1435,7 @@ static void convertToSIMT(Method& method, const Analysis& analysis, uint8_t vect
                     // The access is split up into the lanes after the linearization of the control flow, which knows
                     // the lanes to access.
                     auto address = mem->op == MemoryOperation::READ ? mem->getSource() : mem->getDestination();
-                    auto addresses = insertAddressVector(&method, &it, analysis, address);
-                    if(!addresses)
-                        throw CompilationError(CompilationStep::NORMALIZER,
-                            "SIMT: failed to calculate the per-lane addresses", mem->to_string());
-                    scatteredAccesses.emplace(mem, *addresses);
+                    scatteredAccesses.emplace(mem, addressVectors.get(address));
                     CPPLOG_LAZY(logging::Level::DEBUG,
                         log << "SIMT: memory access per lane: " << mem->to_string() << logging::endl);
                     it.nextInBlock();
