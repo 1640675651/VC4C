@@ -28,8 +28,9 @@ In SIMT mode **a QPU runs 16 work-items at a time, one per SIMD lane**:
   local IDs in y and z; the last chunk of a row may be shorter). VC4CL deals all chunks of all work-groups round-robin across the 12 QPUs: QPU *q* runs
   the chunks *q*, *q* + 12, *q* + 24, … one after the other within a single launch (see "Work-group
   loop"). One large work-group uses all QPUs, and many small ones run side by side;
-- SIMT kernels have no barriers or `__local` memory, so it doesn't matter which QPU runs which chunk,
-  or when;
+- for kernels without barriers or `__local` memory it doesn't matter which QPU runs which chunk, or
+  when. Kernels with barriers or `__local` memory run each work-group on a *team* of QPUs, which
+  loops over the work-group's chunks (see roadmap item 3);
 - in a chunk shorter than 16, the lanes beyond the work-group's end are inactive: they compute
   garbage, but never store it (see below). Every QPU knows its active lanes from the uniforms:
   `min(16, local_size − first_local_id)`.
@@ -38,8 +39,8 @@ In SIMT mode **a QPU runs 16 work-items at a time, one per SIMD lane**:
 
 The chunk scheduling works for any kernel whose work-items never interact (no barriers, no `__local`
 memory), also for kernels which don't qualify for SIMT mode, in both modes: their chunks are a single
-work-item, in any dimension. Only kernels with barriers or `__local` memory still need all work-items
-of a work-group running at the same time, one per QPU, so at most 12 per work-group.
+work-item, in any dimension. Kernels with barriers or `__local` memory loop over the work-items (or
+chunks) of their work-group, see roadmap item 3.
 
 The limits are the same in both modes, the mode is chosen per process, before anything is compiled:
 
@@ -50,7 +51,7 @@ The limits are the same in both modes, the mode is chosen per process, before an
 | `CL_KERNEL_WORK_GROUP_SIZE`, SIMT kernels | 192 | (no SIMT kernels) |
 | `CL_KERNEL_WORK_GROUP_SIZE`, other kernels with independent work-items | 192 | 192 |
 | `CL_KERNEL_WORK_GROUP_SIZE`, kernels with barriers or `__local` memory, with work-item loops | 192 | 192 |
-| `CL_KERNEL_WORK_GROUP_SIZE`, other kernels with barriers or `__local` memory (64-bit values kept across barriers, or loops disabled) | 12 | 12 |
+| `CL_KERNEL_WORK_GROUP_SIZE`, other kernels with barriers or `__local` memory (work-item loops disabled or not supported, e.g. structs kept across barriers) | 12 | 12 |
 
 A kernel may report a lower limit than the device, as OpenCL allows. In classic mode, VC4CL compiles
 every kernel with `--fno-simt`. (Until 2026-10-06, classic mode reported 12 for the device and for all
@@ -388,10 +389,22 @@ VPM DMA (SIMT kernels keep `__local` memory in RAM, see roadmap item 3), and the
 the two barriers per tile are stored to RAM, so the kernel is as slow as classic mode. CLBlast's
 parameter database got a `Broadcom` entry with the first parameter set, and a minimum size of 16 for
 the indirect `Xgemm` path (default 896, so the tests used only `XgemmDirect`). CLBlast's SGEMM test
-then passes all 234 cases (278 skipped: CBLAS has no error codes to compare with). The whole
-`clblast_client_xgemm` run of 256³ takes 320 ms: CLBlast's helper kernels which pad and transpose the
-matrices for `Xgemm` take most of the time (they have barriers and `__local` memory and run with
-work-item loops).
+then passes all 234 cases (278 skipped: CBLAS has no error codes to compare with).
+
+The whole SGEMM call (`clblast_client_xgemm -precision 32`, row-major, kernel times per call from
+`cts-results/tools/clprof`), SIMT mode:
+
+| n | whole call, classic transposes | whole call, SIMT transposes with teams | `TransposeMatrix` | `TransposePadMatrix` | `TransposeMatrixFast` (classic) | `Xgemm` |
+|---|---|---|---|---|---|---|
+| 256 | 302 ms | 240 ms (0.14 GFLOPS) | 111 → 78 ms | 96 → 79 ms | 61 → 52 ms | 35 ms |
+| 512 | 1336 ms | 1148 ms (0.23 GFLOPS) | 445 → 363 ms | 408 → 305 ms | 242 ms | 244 ms |
+
+Column-major 512³ takes 423 ms (was 482 ms, 0.64 GFLOPS): it only needs `TransposeMatrixFast` and
+`Xgemm`. CLBlast's helper kernels which pad and transpose the matrices for `Xgemm` take most of the
+time. In SIMT mode the transposes' `__local` stores (`tile[ly][lx]` read back transposed) are run
+lane by lane, up to 16 DMA writes instead of one, so they gain much less than 16 lanes suggest.
+`TransposeMatrixFast` stores `float4` vectors to non-contiguous addresses, which SIMT mode doesn't
+support, so it runs in classic mode.
 
 ## Caveats
 
@@ -410,12 +423,12 @@ before, so most of these only matter for SIMT kernels.
   and iteration.
 - Stores in divergent code where not all lanes are active (the QPU where a bounds check ends, or
   data-dependent conditions) store lane by lane: up to 16 single-word DMAs instead of one.
-- **No atomics, private arrays, vector types, 64-bit values or non-contiguous accesses**
-  (`p[2 * gid]`, `p[idx[gid]]`, transposes): these kernels fall back too. Kernels with barriers or
-  `__local` memory run in SIMT mode if they qualify otherwise, looping over the chunks of their
-  work-group; all values differing between the lanes which are kept across a barrier are stored to
-  and loaded from RAM at every barrier, so kernels with many such values and barriers in loops
-  spend time on that.
+- **No atomics, private arrays, vector types or 64-bit values**: these kernels fall back too.
+  Non-contiguous 32-bit accesses (`p[2 * gid]`, `p[idx[gid]]`, transposes) run lane by lane (roadmap
+  item 4), up to 16 accesses instead of one. Kernels with barriers or `__local` memory run in SIMT
+  mode if they qualify otherwise, a team of QPUs looping over the chunks of their work-group; all
+  values differing between the lanes which are kept across a barrier are stored to and loaded from
+  RAM at every barrier, so kernels with many such values and barriers in loops spend time on that.
 - Kernels whose work-item IDs only come from dimension 0. IDs of dimensions 1 and 2 are uniform
   within a chunk and allowed (tested with 2- and 3-dimensional NDRanges, also with global work
   offsets: OpenCL-CTS `global_work_offsets`).
@@ -425,11 +438,13 @@ before, so most of these only matter for SIMT kernels.
 - SIMT kernels accept work-groups of any dimensions, up to 192 work-items. A chunk only covers one
   row in x, so narrow work-groups waste lanes: 18 × 10 runs 10 chunks of 16 and 10 of 2 work-items,
   4 × 4 uses 4 of 16 lanes.
-- **Kernels keeping 64-bit values across barriers report `CL_KERNEL_WORK_GROUP_SIZE` 12, below the
-  device limit of 192** (see roadmap item 3). OpenCL allows this, but applications which use the
-  device limit as their local size without checking the kernel's limit fail with
-  `CL_INVALID_WORK_GROUP_SIZE` for such kernels. Classic mode has the same limits. All other kernels
-  accept 192 in either mode, also if they don't qualify for SIMT mode.
+- All kernels accept 192 work-items in either mode, also if they don't qualify for SIMT mode (see
+  roadmap item 3). Only kernels with barriers or `__local` memory which the work-item loops don't
+  support (values other than scalars, vectors and pointers kept across a barrier, or with the loops
+  disabled by `VC4C_NO_WORK_ITEM_LOOPS` or `--fno-work-item-loops`) report
+  `CL_KERNEL_WORK_GROUP_SIZE` 12. OpenCL allows this, but applications which use the device limit as
+  their local size without checking the kernel's limit fail with `CL_INVALID_WORK_GROUP_SIZE` for
+  such kernels.
 - Without a given local size, VC4CL picks the largest divisor of the global size up to 192: a global
   size of 100 gives a single work-group of 100 (7 chunks, the last with 4 active lanes).
 
@@ -606,10 +621,10 @@ and on the compiler being correct in both modes (see step 1).
 ### 3. 192 work-items per work-group for every kernel, in both modes
 
 Goal: every kernel accepts work-groups of up to 192 work-items, in SIMT and in classic mode, so the
-device limits are the same in both modes and no kernel reports less than the device. Today kernels
-with barriers or `__local` memory accept only 12 (one work-item per QPU, all running at the same
-time), also in SIMT mode, where the device reports 192 (see "Work-group sizes and OpenCL
-conformance"). OpenCL allows a lower per-kernel limit, but applications commonly size their
+device limits are the same in both modes and no kernel reports less than the device. Done
+(2026-10-08) with steps 1 to 7 below. Before, kernels with barriers or `__local` memory accepted only
+12 (one work-item per QPU, all running at the same time), also in SIMT mode, where the device reports
+192 (see "Work-group sizes and OpenCL conformance"). OpenCL allows a lower per-kernel limit, but applications commonly size their
 work-groups from the device limit or hard-code 64 to 256 work-items (e.g. CLBlast's default
 parameters), and then fail with `CL_INVALID_WORK_GROUP_SIZE`. With the same limits, `VC4CL_NO_SIMT` becomes a pure performance and debugging switch, and both modes
 can be compared with identical launches.
@@ -720,8 +735,10 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
    (`promoteSimpleStackAllocations`). Kernels with a required work-group size of at most 12 don't
    loop. Verified with host-checked kernels (a private array, 24 values, `float4`/`float2`/`uchar`/
    `short`/`bool` values kept across a barrier, `async_work_group_copy` in both directions) for
-   work-groups of 1 to 192 work-items, on the GPU in both modes. Only kernels keeping 64-bit values
-   across barriers keep the limit of 12.
+   work-groups of 1 to 192 work-items, on the GPU in both modes. 64-bit values kept across barriers
+   (2026-10-08) are kept as their lower and upper 32-bit words, which the 64-bit operations use after
+   VC4C splits them (`normalization/LongOperations.cpp`); verified with `long` sums and products kept
+   across one and several barriers, also in a loop, on the GPU in both modes.
 5. **Done: SIMT mode for kernels with barriers or `__local` memory** (2026-10-07). The SIMT
    conversion accepts them if the work-item loops are enabled, and the QPUs then loop over the
    *chunks* of their work-group instead of single work-items (the same chunks of up to 16
@@ -730,9 +747,9 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
    values kept across barriers which differ between the lanes are vectors, so they are kept in RAM
    (per chunk), uniform ones (e.g. loop counters) in registers. The kernel code reads the local IDs
    of the current chunk instead of the UNIFORM (also for the active lanes of stores and divergent
-   code). VC4CL runs one work-group at a time, on `min(chunks, 12)` QPUs, like in classic mode, so
-   `__local` memory stays per program; in SIMT kernels it is always in RAM, since the VPM can't
-   address 16 consecutive elements at any offset. Barriers in divergent code are rejected (OpenCL
+   code). `__local` memory is always in RAM in SIMT kernels, since the VPM can't address 16
+   consecutive elements at any offset. (Until step 7, VC4CL ran one work-group at a time, on
+   `min(chunks, 12)` QPUs, like in classic mode.) Barriers in divergent code are rejected (OpenCL
    requires them in work-group uniform control flow). Verified with a 2D tiled matrix
    multiplication (tiles of 1×1 to 12×12) and a neighbour exchange through `__local` memory
    (work-groups of 1 to 192, several chunks per row) on the GPU, and with CLBlast's `Xgemm`
@@ -746,10 +763,26 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
      multiplication) read from a wrong address under the resulting register pressure (cause not
      found; such a read can freeze the system). The limit is 8 now.
 
-   Not done: running several work-groups at the same time with per-work-group `__local` regions
-   (in the VPM if they fit, otherwise in RAM), which would use more QPUs for work-groups of fewer
-   than 12 chunks.
 6. (Done with step 1: the classic-mode device limits are 192.)
+7. **Done: several work-groups at the same time in SIMT mode** (2026-10-08). A work-group of `C`
+   chunks runs on a *team* of `Q = min(C, 12)` QPUs, and `T = 12 / Q` teams (at most 6, for the
+   barrier semaphores) run different work-groups at the same time: a work-group of 64 work-items
+   (4 chunks) used 4 of 12 QPUs before, now 3 teams use all 12. Details:
+   - SIMT kernels with work-item loops get two hidden parameters: the QPU's team number
+     (`__vc4cl_work_group_team`) and the address of the team's `__local` variables
+     (`__vc4cl_local_variables`). The `__local` variables of the program are placed one after another
+     (16-byte aligned) in a buffer VC4CL allocates once per team, as are `__local` arguments; the
+     kernel adds the team's offset.
+   - Each team loops over its work-groups independently (the work-group loop with the *next group*
+     flag, see "Work-group loop"): VC4CL deals the work-groups round-robin to the teams, every QPU of
+     a team gets the same sequence of work-groups.
+   - A barrier synchronizes only the QPUs of a team, with two semaphores per team (`2t` and
+     `2t + 1`), selected by a computed branch. The end of every work-group is a team barrier too,
+     before the team's `__local` memory is reused.
+   - The stack frames of the work-items are indexed by `team × work-group size + local linear ID`.
+   - Classic mode is unchanged (one work-group at a time, one work-item per QPU and iteration).
+   - Verified with the tiled matrix multiplications, neighbour exchange, private memory, 64-bit and
+     transposing kernels of steps 4 and 5 and CLBlast's SGEMM test (234 cases) on the GPU.
 
 ### 4. Memory accesses
 
@@ -766,8 +799,13 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
   with the scalar pointer, VC4C's instruction combining (`--fcombine`) treated the address as the
   same in all lanes and some compilations of CLBlast's `TransposePadMatrix` read the wrong tile
   elements (found by testing 6 binaries of the same source 3 times each: the wrong binaries failed
-  every time). Then CLBlast's transposing and padding kernels (`TransposeMatrix`,
-  `TransposePadMatrix`) run in SIMT mode, and its SGEMM test passes all 234 cases.
+  every time). The vector is written next to every write of the pointer, under the same condition,
+  so pointers written in several places (e.g. loop variables) work too (`AddressVectors` in
+  `normalization/SIMT.cpp`). A store counts as a write of its address operand in VC4C's use lists;
+  the first version took the transposes' `__local` stores for a second write of their address and
+  rejected them, so they fell back to classic mode. Now CLBlast's
+  transposing and padding kernels (`TransposeMatrix`, `TransposePadMatrix`) run in SIMT mode, and its
+  SGEMM test passes all 234 cases.
 - Faster non-contiguous accesses: a TMU load with a separate address per lane (VC4C's
   `customAddressCalculation`, inactive lanes need a safe address, since TMU requests can't be
   masked), and strided stores by a single VDW with a memory stride.
