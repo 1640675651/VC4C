@@ -62,7 +62,7 @@ kernels.) Kernels with barriers or `__local` memory get work-item loops if suppo
 
 Measured with hand-assembled QPU programs submitted through the vc4 compute ioctls:
 `vc4-compute/tests/qpu_probe.py`, whose assembler reproduces VC4C's encodings of 15 reference
-instructions exactly.
+instructions exactly, and `cts-results/tools/fifo/fifo_probe.py` for the TMU throughput (2026-10-09).
 
 | Question | Result |
 |---|---|
@@ -73,6 +73,11 @@ instructions exactly.
 | `tmu0_s` write with some lanes at address 0 | **Does not disable those lanes, and the other lanes' values come back wrong** (inferred: the kernel's stores addressed with them went astray, and loading a valid address instead fixed it). Found with OpenCL-CTS, see "Known bugs" in the roadmap. |
 | VPM-to-memory DMA (VDW) of part of a row | **Works exactly.** Start column and width (`VPMBase` column bits, `Depth`) write only the selected words; memory around them is untouched. |
 | Branches | Condition on "all lanes" or "any lane" (`ifallzc`, `ifanyz`, …). |
+| TMU loads in flight per QPU (requests written before reading the results) | **8 work** (on one TMU, or alternating between both); **12 hang** the QPU until the driver resets it. 9–11 not tested. |
+| Load time, 1 QPU, addresses missing the caches | 305 ns per load with one in flight, 88 ns with 8 in flight (3.5×). |
+| Load time, 12 QPUs, cache hits (4 KB per QPU) | 768 ns per load and QPU with one in flight, about 390 ns with 2 or more: the shared TMUs/L2 limit the throughput, not the latency. With misses (8 MB): 816 ns, 686 ns with 8 in flight (DRAM bandwidth, about 1 GB/s). |
+| Load with the same address in all 16 lanes | **Costs the same as 16 different addresses** (also with 12 QPUs), so a work-group uniform value loaded through the TMU uses as much TMU throughput as a whole vector. |
+| Reading memory through the UNIFORM stream (`unif_addr` written, 2 nops, then UNIFORM reads) | Correct values. 12 QPUs, cached: 90 ns per value for 2 groups of 4 consecutive words, 309 ns for single words; it runs mostly in parallel with TMU loads. **But repositioning the stream often on uncached data hangs the QPU intermittently**: single words at 8 addresses per loop iteration hung 3 of 10 runs (12 QPUs, 8 MB), 1 of 10 with 8 nops after each read, 0 of 10 with 32 nops (slower than the TMU); 2 groups of 4 words hung 0 of 30 runs. Presumably a repositioning while the uniform cache is still prefetching from memory. Too risky for compiled code. |
 
 **Per-lane conditions only work for register writes.** Writes to peripheral registers (VPM, TMU, and
 presumably the other I/O registers) always act on all 16 lanes.
@@ -818,8 +823,14 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
 
 ### 5. Control flow and work-item functions
 
-- **Computed branches** (`switch` lowered to a jump table) in divergent code: convert to a chain of
-  conditional edges, or handle as a multi-way edge in the region linearization.
+- **Done (2026-10-09): `switch` statements.** VC4C lowered every `switch` to a computed branch (the
+  target selected by comparing with every case), which the SIMT conversion doesn't support, so any
+  kernel with a `switch` ran in classic mode. The front-end now lowers it to a chain of conditional
+  branches (`if(v == case 0) goto …; if(v == case 1) goto …; …; goto default`) with as many
+  comparisons, which the divergent-branch handling supports (`llvm/LLVMInstruction.cpp`). Verified
+  with dense, sparse and fall-through `switch`es on per-work-item values
+  (`cts-results/tools/sw/sw_check`, 7 work-group configurations each) in the emulator and on the GPU in
+  both modes.
 - **Done (2026-10-08): blocks not laid out between the entry and merge point of their region.**
   Clang sometimes places e.g. the body of an `if` after the following block, which looked like a loop
   entered in the middle (CLBlast's `CopyMatrix`, `CopyPadMatrix` and `XgemmDirect`). If the
@@ -840,16 +851,21 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
   mixed vector widths in one kernel, real shuffles (rotations within each work-item's lanes),
   vector parameters (tile them after loading), non-splat vector constants (repeat per work-item),
   calls to VC4C intrinsics working on vectors (`dot`, `length`, … need the per-work-item layout).
-- Use the QPU's per-quad replication for N = 4 instead of 3 rotations.
+- **Done (2026-10-09): the QPU's per-quad replication for N = 4.** With 4 lanes per work-item, the
+  work-items are the quads, so replicating a work-item's first element to its lanes (splats, element
+  extraction) is one write of `r5` in per-quad mode instead of 3 rotations, flag settings and
+  conditional moves. Verified with splats, horizontal sums, a dot product and element extraction of
+  `float4`/`int4` (`cts-results/tools/vec/vec_check`) in the emulator and on the GPU in both modes;
+  clpeak's `float4` is unchanged (8.30 GFLOPS), since its kernel replicates only once.
 
 ### 7. Conformance details
 
-- Device limits: `CL_DEVICE_MAX_WORK_GROUP_SIZE` 192 with lower per-kernel limits is allowed, but the
-  goal is 192 for every kernel in both modes (item 3); check
-  `CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE` (16 for SIMT kernels, 16 / N for vector kernels, 1
-  otherwise) and `CL_DEVICE_MAX_WORK_ITEM_SIZES` against the CTS expectations.
-- Inactive lanes read up to 60 bytes past the accessed elements. Harmless on this hardware (RAM, no
-  MMU), but a buffer at the very end of the GPU memory could read beyond it.
+- **Done: device limits.** 192 for every kernel in both modes (item 3);
+  `CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE` is 16 for SIMT kernels, 16 / N for vector kernels
+  and 1 otherwise, and the `test_api` subtests checking these queries pass in both modes.
+- **Done (2026-10-09): reads past the end of a buffer.** Inactive lanes read up to 60 bytes past the
+  accessed elements. VC4CL's DRM back-end now reserves 64 bytes after every buffer (rounded up to
+  whole pages as before), so these reads stay inside the buffer object (`hal/DRM.cpp`).
 - Long launches: one compute job runs up to about 10,000 chunks and blocks OpenGL meanwhile; a hang
   takes up to the driver's 10-minute limit to be reset. Consider shorter launches (time-sliced) for
   interactive systems.
@@ -857,8 +873,20 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
 ### 8. Performance (not required for conformance)
 
 - Memory latency: issue several TMU loads before waiting for the first (a QPU runs a single
-  thread, so this is the only way to hide DRAM latency).
+  thread, so this is the only way to hide DRAM latency). Measured (see the hardware table): 3.5×
+  faster loads on one QPU with 8 in flight, but with all 12 QPUs loading at most 2 in flight help.
+- **Tried (2026-10-09), not enabled: combining TMU loads of single values.** CLBlast's `Xgemm` loads
+  B (the same value for all lanes) with 8 TMU loads per loop iteration, each a full 16-lane request
+  for one useful value. The pass `CombineTMULoads` (`--fcombine-tmu-loads`) combines such loads in a
+  block into one load with an address per lane and extracts the values (correct in the emulator and
+  on the GPU), which halved `Xgemm`'s TMU loads, but made it only 3% faster (228 vs 234 ms for
+  512³): `Xgemm` isn't limited by the number of TMU requests. Each load waits about 770 ns when all
+  12 QPUs load (167 ns on one QPU); the shared resource limiting this (TMU, L2 cache or memory bus)
+  isn't known yet. Next: a probe with `Xgemm`'s access pattern, or the V3D performance counters.
+- Reading memory through the UNIFORM stream instead of the TMU: rejected, it can hang the QPU (see
+  the hardware table).
 - Stores of the 12 QPUs are serialized by the GPU-wide VPM mutex; per-QPU VPM areas would allow
   concurrent DMA setup.
-- clpeak's global-bandwidth test: report a maximum allocation size of a quarter of the CMA area, so
-  it can allocate its buffers under memory pressure.
+- **Done (2026-10-08):** clpeak's global-bandwidth test: VC4CL reports half of the CMA area as global
+  memory and a quarter of it as the maximum allocation size (VC4CL `d64a175`), so it can allocate its
+  buffers under memory pressure.
