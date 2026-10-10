@@ -1287,6 +1287,13 @@ static Value rotate(Method& method, InstructionWalker& it, const Value& src, uin
 static void insertWorkItemReplication(Method& method, InstructionWalker& it, const Value& src, const Value& dest,
     uint8_t vectorWidth, const Value& elementIndex)
 {
+    if(vectorWidth == 4)
+    {
+        // the work-items are the quads, and the per-quad replication copies the first element of every quad
+        assign(it, Value(REG_REPLICATE_QUAD, src.type)) = src;
+        assign(it, dest) = Value(REG_REPLICATE_QUAD, src.type);
+        return;
+    }
     assign(it, dest) = src;
     for(uint32_t offset = 1; offset < vectorWidth; ++offset)
     {
