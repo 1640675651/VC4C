@@ -715,19 +715,19 @@ bool Switch::mapInstruction(Method& method)
         log << "Generating branches for switch on " << cond.to_string() << " with " << jumpLabels.size()
             << " options and the default " << defaultLabel.to_string() << logging::endl);
 
-    // since we need to read the branch target from SIMD element 15 and our (scalar) comparison value is on element 0,
-    // we need to replicate it across all elements (or vector-rotate, but this takes the same amount of instructions)
-    auto tmpCond = method.addNewLocal(cond.type, "%switch.cond");
-    auto dummyIt = intermediate::insertReplication(method.appendToEnd(), cond, tmpCond);
-    (void) dummyIt;
-
-    auto targetLabel = method.addNewLocal(TYPE_CODE_ADDRESS, "%switch");
-    // use default label as default value if no other condition is applied
-    method.appendToEnd(std::make_unique<intermediate::CodeAddress>(targetLabel, defaultLabel.local()));
-    for(const auto& option : jumpLabels)
+    /*
+     * A chain of conditional branches: if(cond == case 0) goto label 0; if(cond == case 1) goto label 1; ...; goto
+     * default. This takes as many comparisons as selecting the target of a single computed branch, but the SIMT
+     * conversion supports conditional branches, also if the condition differs between the work-items, and not computed
+     * branches.
+     */
+    // deterministic order of the comparisons
+    std::vector<std::pair<uint64_t, Value>> options(jumpLabels.begin(), jumpLabels.end());
+    std::sort(options.begin(), options.end(),
+        [](const std::pair<uint64_t, Value>& a, const std::pair<uint64_t, Value>& b) { return a.first < b.first; });
+    for(const auto& option : options)
     {
-        // for every case, if equal, set target label accordingly
-        Value tmp = method.addNewLocal(TYPE_BOOL, "%switch");
+        Value isCase = method.addNewLocal(TYPE_BOOL, "%switch");
         Value comparisonValue = UNDEFINED_VALUE;
         if(option.first > std::numeric_limits<uint32_t>::max())
         {
@@ -737,13 +737,16 @@ bool Switch::mapInstruction(Method& method)
         else
             comparisonValue = Value(Literal(static_cast<uint32_t>(option.first)), TYPE_INT32);
         method.appendToEnd(std::make_unique<intermediate::Comparison>(
-            intermediate::COMP_EQ, Value(tmp), Value(tmpCond), std::move(comparisonValue)));
-        method.appendToEnd(
-            std::make_unique<intermediate::MoveOperation>(NOP_REGISTER, tmp, COND_ALWAYS, SetFlag::SET_FLAGS));
-        method.appendToEnd(
-            std::make_unique<intermediate::CodeAddress>(targetLabel, option.second.local(), COND_ZERO_CLEAR));
+            intermediate::COMP_EQ, Value(isCase), Value(cond), std::move(comparisonValue)));
+        auto pair = intermediate::insertBranchCondition(method, method.appendToEnd(), isCase);
+        auto next = method.addNewLocal(TYPE_LABEL, "%switch.next");
+        method.appendToEnd(std::make_unique<intermediate::Branch>(option.second.local(), pair.second))
+            .addDecorations(decorations);
+        method.appendToEnd(std::make_unique<intermediate::Branch>(next.local(), pair.second.invert()))
+            .addDecorations(decorations);
+        method.appendToEnd(std::make_unique<intermediate::BranchLabel>(*next.local()));
     }
-    method.appendToEnd(std::make_unique<intermediate::Branch>(targetLabel.local()));
+    method.appendToEnd(std::make_unique<intermediate::Branch>(defaultLabel.local())).addDecorations(decorations);
 
     return true;
 }
