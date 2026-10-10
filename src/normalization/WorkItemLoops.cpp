@@ -548,8 +548,15 @@ static FastMap<const Local*, Context> createContexts(Method& method, const std::
     });
     FastMap<const Local*, Context> contexts;
     std::size_t numRegisters = 0;
+    /*
+     * In classic mode, values kept in the lanes of registers make some kernels compute wrong results under high
+     * register pressure (e.g. CLBlast's Xgemm with tiles in __local memory: 8 accumulators per work-item kept across
+     * the barriers of the loop over the k-tiles). The cause isn't found yet: it shows only for some compilations of the
+     * same kernel, and never with all values kept in the work-items' stack frames. So classic mode keeps them all in
+     * memory. SIMT kernels keep only work-group uniform values (e.g. loop counters) in registers.
+     */
+    std::size_t maxRegisters = method.metaData.mergedWorkItemsFactor > 1 ? MAX_REGISTER_CONTEXTS : 0;
     // for debugging: a lower number of values kept in registers
-    std::size_t maxRegisters = MAX_REGISTER_CONTEXTS;
     if(auto env = std::getenv("VC4C_WORK_ITEM_LOOP_REGISTERS"))
         maxRegisters = std::min(maxRegisters, static_cast<std::size_t>(std::atoi(env)));
     for(auto loc : values)

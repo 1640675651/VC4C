@@ -622,6 +622,25 @@ and on the compiler being correct in both modes (see step 1).
   several times against a reference output: a wrong binary fails every time. Verified with 60
   compilations, all correct (before: 5 of 70 wrong). The harness (`shuffle/shb_check.c`, with
   `BINARY`, `REF`, `GLOBAL` and `LOCAL`) is in `cts-results/tools/`.
+- **Worked around (2026-10-10), cause not found: wrong results of classic-mode work-item loops under
+  high register pressure.** CLBlast's `Xgemm` with its tiles in `__local` memory (`SA = SB = 1`, 8
+  accumulators per work-item kept across the barriers of the loop over the k-tiles, 64 work-items)
+  computed wrong results in classic mode (1983 of 2048 for 64 × 32 × 32), only with more than one
+  k-tile, and only for some compilations of the same kernel (VC4C's output differs between runs,
+  since some maps are keyed by pointers; with address space randomization disabled, `setarch -R`, the
+  compilations are reproducible). Wrong compilations always got the same 481 of 512 elements wrong
+  (32 × 16 × 32), SIMT mode was always correct. Many unrelated changes hid it (disabling the
+  instruction reordering, the loop-invariant code motion or single steps, skipping single register
+  fix-up groupings), a single NOP replacement of the reordering exposed it, so it depends on the exact
+  register allocation. Ruled out: lanes shared by two live locals (an independent liveness check of
+  the register mapping found no conflicts in wrong compilations), overlaps of spilled locals and VPM
+  DMA areas, flags clobbered before the loop's branch, and values valid only in the first lane
+  (replicating grouped values did not help). Never wrong with all values kept across barriers in the
+  work-items' stack frames, so classic mode now keeps no values in the lanes of registers. Verified
+  with 15 compilations of 5 reduced variants in the emulator and the kernel at 256³ on the GPU. The
+  reduced kernels, the debugging switches used (limits for the reordering and the groupings, the
+  register mapping check) and the harness option `BINARY` (`clblast/xgemm_time`) are in
+  `cts-results/tools/xred/`.
 
 ### 3. 192 work-items per work-group for every kernel, in both modes
 
@@ -733,7 +752,8 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
    work-item of the work-group. Of the values kept across barriers, up to 8 scalars (those kept
    across the most barriers) stay in the lanes of vector registers, all others (also vectors) are
    stored in private variables in the work-item's frame at the end of a region and loaded at the
-   start of the next one. `async_work_group_copy` and `wait_group_events` need nothing special: the
+   start of the next one. (Since 2026-10-10, classic mode keeps all of them in the frames, see
+   "Known bugs".) `async_work_group_copy` and `wait_group_events` need nothing special: the
    copy is done by the work-items with local ID 0 in x, and the wait is a barrier. Private variables
    of scalar or vector types which are only loaded and stored as a whole (clang keeps some, e.g. with
    life-time markers) become ordinary values before both passes
