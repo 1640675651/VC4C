@@ -46,6 +46,14 @@ namespace vc4c
         std::size_t groupTMUAccess(const Module& module, Method& method, const Configuration& config);
 
         /**
+         * Combines loads of single 32-bit values via the same TMU (e.g. of work-group uniform values in SIMT kernels)
+         * into one load with a separate address per SIMD element, since the TMUs' throughput is per load, not per
+         * useful element. Not enabled by default: it halved the TMU loads of CLBlast's Xgemm, but only made it 3%
+         * faster (enable with --fcombine-tmu-loads).
+         */
+        std::size_t combineTMULoads(const Module& module, Method& method, const Configuration& config);
+
+        /**
          * Tries to find TMU loads within loops where we can pre-calculate the address for loads in the next loop
          * iteration and thus we can pre-fetch the data loaded for the next loop iteration into the TMU FIFO.
          */

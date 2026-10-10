@@ -277,6 +277,9 @@ const std::vector<OptimizationPass> Optimizer::ALL_PASSES = {
         "pre-fetches read-only memory loaded in loops", OptimizationType::INITIAL),
     OptimizationPass("GroupTMUAccess", "group-memory", groupTMUAccess,
         "merges memory accesses for adjacent memory and cache areas", OptimizationType::INITIAL),
+    OptimizationPass("CombineTMULoads", "combine-tmu-loads", combineTMULoads,
+        "combines loads of single values via the same TMU into one load with an address per element",
+        OptimizationType::INITIAL),
     OptimizationPass("GroupLoweredRegisterAccess", "group-memory", groupLoweredRegisterAccess,
         "merges memory accesses for adjacent memory and cache areas", OptimizationType::INITIAL),
     /*

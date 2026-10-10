@@ -1375,6 +1375,251 @@ std::size_t optimizations::groupTMUAccess(const Module& module, Method& method, 
     return numChanges;
 }
 
+/*
+ * A group of loads of single 32-bit values via the same TMU, whose addresses need not have any known relation. Every
+ * TMU request reads 16 elements and the TMUs' throughput is per request (also if all elements use the same address),
+ * so e.g. the work-group uniform values a SIMT kernel loads separately (one useful element per request) can be loaded
+ * by a single request with a separate address per element instead.
+ */
+struct GeneralTMUGroup
+{
+    FastAccessList<TypedInstructionWalker<intermediate::RAMAccessInstruction>> ramReads;
+    FastAccessList<TypedInstructionWalker<intermediate::CacheAccessInstruction>> cacheReads;
+    // instructions only moving the loaded values (e.g. SIMT replications), which are moved after the combined load
+    FastAccessList<InstructionWalker> deferred;
+};
+
+static bool isSingleWordTMURead(const intermediate::RAMAccessInstruction& load)
+{
+    auto entry = load.getTMUCacheEntry();
+    if(load.op != intermediate::MemoryOperation::READ || !entry || entry->customAddressCalculation)
+        return false;
+    auto numElements = entry->numVectorElements.getLiteralValue();
+    if(!numElements || numElements->unsignedInt() != 1 || entry->elementStrideInBytes != 4)
+        return false;
+    auto reader = entry->getCacheReader();
+    if(!reader || !reader->getOutput())
+        return false;
+    const auto& type = reader->getData().type;
+    if(!type.isScalarType() || type.getScalarBitCount() != 32)
+        return false;
+    // volatile memory must be read exactly as written
+    auto baseAndOffset = findBaseAndOffset(load.getMemoryAddress());
+    auto base = baseAndOffset ? baseAndOffset->baseAddress : nullptr;
+    return !(base && base->is<Parameter>() &&
+        has_flag(base->as<Parameter>()->decorations, ParameterDecorations::VOLATILE));
+}
+
+static bool isReplicationRead(const intermediate::IntermediateInstruction& inst)
+{
+    return inst.readsRegister(REG_REPLICATE_ALL) || inst.readsRegister(REG_REPLICATE_QUAD) ||
+        inst.readsRegister(REG_ACC5);
+}
+
+/*
+ * Whether the instruction only moves the value of a pending (loaded, but not yet available) local: a move into a
+ * local or into the replication register (r5), unconditional and without any side effects.
+ */
+static bool isDeferrableMove(const intermediate::IntermediateInstruction& inst)
+{
+    auto move = dynamic_cast<const intermediate::MoveOperation*>(&inst);
+    if(!move || move->getVectorRotation() || inst.hasConditionalExecution() || inst.doesSetFlag() ||
+        inst.hasUnpackMode() || inst.hasPackMode() || inst.getSignal() != SIGNAL_NONE)
+        return false;
+    return inst.checkOutputLocal() || inst.writesRegister(REG_REPLICATE_ALL) ||
+        inst.writesRegister(REG_REPLICATE_QUAD);
+}
+
+NODISCARD static InstructionWalker findGeneralTMUGroup(InstructionWalker it, GeneralTMUGroup& group)
+{
+    // the outputs of the group's loads (and of deferred moves of them), which must not be read before the combined
+    // load
+    FastSet<const Local*> pendingLocals;
+    FastSet<const Local*> addresses;
+    // the TMU of the group, -1 before the first load
+    int tmuIndex = -1;
+    // whether the last instruction was a deferred write of the replication register (whose read has to be deferred
+    // too)
+    bool pendingReplication = false;
+    for(; !it.isEndOfBlock(); it.nextInBlock())
+    {
+        if(!it.has())
+            continue;
+        bool readsPending = false;
+        it->forReadLocals([&](const Local* loc, const intermediate::IntermediateInstruction&) {
+            if(pendingLocals.find(loc) != pendingLocals.end())
+                readsPending = true;
+        });
+        if(pendingReplication)
+        {
+            // the read of the replication register directly following a deferred write of it
+            pendingReplication = false;
+            if(isReplicationRead(*it.get()) && isDeferrableMove(*it.get()) && it->checkOutputLocal() &&
+                !readsPending)
+            {
+                group.deferred.emplace_back(it);
+                pendingLocals.emplace(it->checkOutputLocal());
+                continue;
+            }
+            // the replication register is read by something we cannot move, so we cannot move its write either
+            group.deferred.pop_back();
+            return it.previousInBlock();
+        }
+        if(readsPending)
+        {
+            if(group.ramReads.empty() || !isDeferrableMove(*it.get()) || isReplicationRead(*it.get()))
+                return it;
+            group.deferred.emplace_back(it);
+            if(auto out = it->checkOutputLocal())
+                pendingLocals.emplace(out);
+            else
+                pendingReplication = true;
+            continue;
+        }
+        if(auto out = it->checkOutputLocal())
+        {
+            if(pendingLocals.find(out) != pendingLocals.end() || addresses.find(out) != addresses.end())
+                // a loaded value or an address is overwritten before the combined load
+                return it;
+        }
+        auto load = it.get<intermediate::RAMAccessInstruction>();
+        auto entry = load ? load->getTMUCacheEntry() : nullptr;
+        if(!entry)
+        {
+            if(it.get<intermediate::CacheAccessInstruction>() &&
+                it.get<intermediate::CacheAccessInstruction>()->getTMUCacheEntry() &&
+                it.get<intermediate::CacheAccessInstruction>()->getTMUCacheEntry()->getTMUIndex() == tmuIndex)
+                // the result of a load not in the group, on the same TMU
+                return it;
+            continue;
+        }
+        if(tmuIndex >= 0 && entry->getTMUIndex() != tmuIndex)
+            // a load via the other TMU is independent
+            continue;
+        if(!isSingleWordTMURead(*load))
+        {
+            if(group.ramReads.empty())
+                continue;
+            return it;
+        }
+        // the result has to be read directly after the load (no other access to the TMU in between)
+        auto readIt = it.copy().nextInBlock();
+        while(!readIt.isEndOfBlock() && !readIt.has())
+            readIt.nextInBlock();
+        auto cacheRead = readIt.isEndOfBlock() ? nullptr : readIt.get<intermediate::CacheAccessInstruction>();
+        if(!cacheRead || cacheRead->getTMUCacheEntry().get() != entry.get())
+        {
+            if(group.ramReads.empty())
+                continue;
+            return it;
+        }
+        tmuIndex = entry->getTMUIndex();
+        group.ramReads.emplace_back(typeSafe(it, *load));
+        group.cacheReads.emplace_back(typeSafe(readIt, *cacheRead));
+        if(auto addressLocal = load->getMemoryAddress().checkLocal())
+            addresses.emplace(addressLocal);
+        pendingLocals.emplace(cacheRead->getOutput()->local());
+        it = readIt;
+        if(group.ramReads.size() == NATIVE_VECTOR_SIZE)
+            return it.nextInBlock();
+    }
+    if(pendingReplication)
+        group.deferred.pop_back();
+    return it;
+}
+
+NODISCARD static bool combineGeneralTMUReads(Method& method, GeneralTMUGroup& group)
+{
+    auto numLoads = static_cast<uint8_t>(group.ramReads.size());
+    if(numLoads < 2)
+        return false;
+    CPPLOG_LAZY(logging::Level::DEBUG,
+        log << "Combining " << static_cast<unsigned>(numLoads)
+            << " single-word TMU loads into one load with an address per element, starting with: "
+            << group.ramReads.front()->to_string() << logging::endl);
+
+    // 1. the combined load is the last one, so all addresses are already calculated
+    auto lastLoad = group.ramReads.back().get();
+    auto entry = lastLoad->getTMUCacheEntry();
+    const Value& addresses = entry->addresses;
+    InstructionWalker it = group.ramReads.back();
+    // the elements beyond the group load the first address, which is loaded anyway
+    it = intermediate::insertReplication(it, group.ramReads.front()->getMemoryAddress(), addresses);
+    for(uint8_t i = 1; i < numLoads; ++i)
+        it = intermediate::insertVectorInsertion(
+            it, method, addresses, Value(Literal(i), TYPE_INT8), group.ramReads[i]->getMemoryAddress());
+    entry->numVectorElements = Value(Literal(numLoads), TYPE_INT8);
+    entry->customAddressCalculation = true;
+    lastLoad->setMemoryAddress(addresses);
+
+    // 2. the element i of the combined result is the value of load i
+    auto lastRead = group.cacheReads.back().get();
+    auto combined = method.addNewLocal(lastRead->getData().type.toVectorType(numLoads), "%combined_tmu_loads");
+    FastAccessList<Value> outputs;
+    for(auto& read : group.cacheReads)
+        outputs.emplace_back(*read->getOutput());
+    lastRead->setOutput(combined);
+    it = group.cacheReads.back().base().copy().nextInBlock();
+    for(uint8_t i = 0; i < numLoads; ++i)
+        it = intermediate::insertVectorExtraction(it, method, combined, Value(Literal(i), TYPE_INT8), outputs[i]);
+
+    // 3. move the deferred instructions located before the combined load after it (in their order)
+    for(auto& deferred : group.deferred)
+    {
+        if(deferred.getBasicBlock() != it.getBasicBlock())
+            continue;
+        bool beforeCombined = false;
+        for(auto check = deferred.copy(); !check.isEndOfBlock(); check.nextInBlock())
+        {
+            if(check == group.cacheReads.back().base())
+            {
+                beforeCombined = true;
+                break;
+            }
+        }
+        if(!beforeCombined)
+            continue;
+        it.emplace(deferred.release());
+        it.nextInBlock();
+    }
+
+    // 4. remove the other loads
+    for(uint8_t i = 0; i + 1 < numLoads; ++i)
+    {
+        group.cacheReads[i].base().erase();
+        group.ramReads[i].base().erase();
+    }
+    return true;
+}
+
+std::size_t optimizations::combineTMULoads(const Module& module, Method& method, const Configuration& config)
+{
+    std::size_t numChanges = 0;
+    for(auto& block : method)
+    {
+        auto it = block.walk();
+        while(!it.isEndOfBlock())
+        {
+            GeneralTMUGroup group;
+            it = findGeneralTMUGroup(it, group);
+            if(group.ramReads.size() > 1 && combineGeneralTMUReads(method, group))
+            {
+                ++numChanges;
+                PROFILE_COUNTER(vc4c::profiler::COUNTER_OPTIMIZATION, "TMU loads combined", group.ramReads.size());
+                // continue after the combined load
+                it = group.cacheReads.back().base().copy().nextInBlock();
+            }
+            else if(!it.isEndOfBlock() && group.ramReads.empty())
+                it.nextInBlock();
+            else if(!it.isEndOfBlock() && group.ramReads.size() <= 1)
+                it = (group.cacheReads.empty() ? it : group.cacheReads.front().base().copy()).nextInBlock();
+        }
+    }
+    if(numChanges)
+        method.cleanEmptyInstructions();
+    return numChanges;
+}
+
 struct TMULoadOffset
 {
     const Local* baseLocal;
