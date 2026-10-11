@@ -411,6 +411,26 @@ lane by lane, up to 16 DMA writes instead of one, so they gain much less than 16
 `TransposeMatrixFast` stores `float4` vectors to non-contiguous addresses, which SIMT mode doesn't
 support, so it runs in classic mode.
 
+**Since 2026-10-11: `Xgemm` kernel 1 (`GEMMK = 1`), no helper kernels.** CLBlast's second GEMM
+kernel expects all three matrices "rotated" (as in row-major layout), so a row-major SGEMM needs no
+transposed or padded copies (sizes multiple of the tiles), and CLBlast now runs a column-major GEMM
+as the row-major one of the same memory with A and B swapped (C^T = B^T A^T, `Xgemm::DoGemm` and
+`GetTempSize`). The `Broadcom` database entry: `GEMMK = 1, KREG = 4, KWG = KWI = 1, MDIMA = MDIMC =
+16, NDIMB = NDIMC = 4, MWG = NWG = 16, SA = SB = STRM = STRN = 0, VWM = VWN = 1`: 16 × 4 work-items
+computing a 16 × 16 tile of C, the lanes loading consecutive elements of B, and every work-item 4
+consecutive elements (`KREG`) of each of its 4 rows of A, which are the same for all lanes. Those
+loads are combined into one TMU load per row by `--fcombine-tmu-loads` (see roadmap item 8), which
+CLBlast now passes for Broadcom devices: 384 → 244 ms for 512³. The whole SGEMM call (all kernels,
+SIMT mode, `clblast_client_xgemm -precision 32`):
+
+| n | row-major, before | row-major, kernel 1 | column-major, before | column-major, kernel 1 |
+|---|---|---|---|---|
+| 256 | 240 ms | 32 ms (1.03 GFLOPS) | 74 ms | 33 ms (1.03 GFLOPS) |
+| 512 | 1148 ms | 246 ms (1.09 GFLOPS) | 423 ms | 246 ms (1.09 GFLOPS) |
+
+CLBlast's SGEMM test passes all 234 cases. (Its test binaries ignore `-precision` and continue with
+CGEMM, which still fails on this device.)
+
 ## Caveats
 
 Current state (2026-10-03). Kernels that don't qualify for SIMT mode are compiled and run exactly as
@@ -622,7 +642,7 @@ and on the compiler being correct in both modes (see step 1).
   several times against a reference output: a wrong binary fails every time. Verified with 60
   compilations, all correct (before: 5 of 70 wrong). The harness (`shuffle/shb_check.c`, with
   `BINARY`, `REF`, `GLOBAL` and `LOCAL`) is in `cts-results/tools/`.
-- **Worked around (2026-10-10), cause not found: wrong results of classic-mode work-item loops under
+- **Fixed (2026-10-11), first worked around: wrong results of classic-mode work-item loops under
   high register pressure.** CLBlast's `Xgemm` with its tiles in `__local` memory (`SA = SB = 1`, 8
   accumulators per work-item kept across the barriers of the loop over the k-tiles, 64 work-items)
   computed wrong results in classic mode (1983 of 2048 for 64 × 32 × 32), only with more than one
@@ -641,6 +661,21 @@ and on the compiler being correct in both modes (see step 1).
   reduced kernels, the debugging switches used (limits for the reordering and the groupings, the
   register mapping check) and the harness option `BINARY` (`clblast/xgemm_time`) are in
   `cts-results/tools/xred/`.
+
+  The cause, found on 2026-10-11 with a reduced kernel of `--fcombine-tmu-loads` (which got wrong
+  values in the same way): the register fix-ups (grouping scalars into the lanes of vector registers)
+  replicate an extracted value through r5 (`rep_all|r5 = value; copy = r5`) just before its reader,
+  also where r5 was live: between an earlier write of r5 and its read. The instruction reordering
+  runs before the fix-ups and moves e.g. a replication's write of r5 into a much earlier NOP slot, and
+  the work-item loops rotate the contexts by r5 (`r5 = 16 - lane`, then `context << r5`): an inserted
+  replication in between overwrote r5, so the work-item's value was restored from another lane. The
+  fix-ups now insert the extraction and replication before the write of r5 still live at the reader
+  (`findR5FreePosition` in `asm/RegisterFixes.cpp`), and fail the compilation (which is retried) if
+  that isn't possible. With it, 20 of 20 compilations of the reduced kernels with 8 values in
+  registers were correct (before about half wrong). Classic mode still keeps no values in registers:
+  classic kernels looping over their work-items still compute wrong results for some compilations of
+  CLBlast's `Xgemv` when they also loop over the work-groups, which is why they don't (cause not
+  found, also with no values in registers).
 
 ### 3. 192 work-items per work-group for every kernel, in both modes
 
@@ -895,14 +930,26 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
 - Memory latency: issue several TMU loads before waiting for the first (a QPU runs a single
   thread, so this is the only way to hide DRAM latency). Measured (see the hardware table): 3.5×
   faster loads on one QPU with 8 in flight, but with all 12 QPUs loading at most 2 in flight help.
-- **Tried (2026-10-09), not enabled: combining TMU loads of single values.** CLBlast's `Xgemm` loads
-  B (the same value for all lanes) with 8 TMU loads per loop iteration, each a full 16-lane request
-  for one useful value. The pass `CombineTMULoads` (`--fcombine-tmu-loads`) combines such loads in a
-  block into one load with an address per lane and extracts the values (correct in the emulator and
-  on the GPU), which halved `Xgemm`'s TMU loads, but made it only 3% faster (228 vs 234 ms for
-  512³): `Xgemm` isn't limited by the number of TMU requests. Each load waits about 770 ns when all
-  12 QPUs load (167 ns on one QPU); the shared resource limiting this (TMU, L2 cache or memory bus)
-  isn't known yet. Next: a probe with `Xgemm`'s access pattern, or the V3D performance counters.
+- **Combining TMU loads of single values** (2026-10-09, not enabled by default; CLBlast passes it for
+  Broadcom devices since 2026-10-11). The pass `CombineTMULoads` (`--fcombine-tmu-loads`) combines the
+  loads of single 32-bit values via the same TMU in a block (e.g. a value loaded for all lanes) into
+  one load with an address per lane and extracts the values. For CLBlast's `Xgemm` with `GEMMK = 0`
+  it halved the TMU loads, but gained only 3%; for `GEMMK = 1` (4 consecutive elements of A per row)
+  it cut the TMU stalls to a third (384 → 244 ms for 512³), which made that kernel, which needs no
+  helper kernels, as fast. A bug of the register fix-ups (see "Known bugs") made some combined loads
+  wrong (lane 0 of the address vector), fixed. Verified with reduced kernels
+  (`cts-results/tools/comb/`).
+- **Hardware performance counters (2026-10-11).** The vc4 driver's performance monitors
+  (`DRM_IOCTL_VC4_PERFMON_*`) now also count compute jobs (`perfmonid` of `drm_vc4_submit_qpu`), and
+  VC4CL prints 16 counters per kernel with `VC4CL_PERF_COUNTERS=1` (2: also per job). The QPU cycles
+  of compute jobs count as "vertex/coordinate shading" (the busy cycles), split into executing
+  instructions (4 cycles per instruction), stalls waiting for the TMUs, and other stalls not counted
+  separately (VPM, mutex, semaphores). Findings: `Xgemm` (`GEMMK = 0`, 512³) spends 53% of its busy
+  cycles executing instructions (204 per loop iteration, 32 of them arithmetic) and 44% waiting for
+  the TMUs, with hardly any L2 misses (the TMU processes one quad per lane, 16 per load, and the
+  stalls are latency: halving the loads made each wait longer). The transposes are dominated by the
+  stalls not counted (VPM DMA, mutex, barriers), and classic-mode kernels with barriers run every
+  work-group as its own compute job (CLBlast's `TransposeMatrixFast`: 1024 jobs).
 - Reading memory through the UNIFORM stream instead of the TMU: rejected, it can hang the QPU (see
   the hardware table).
 - Stores of the 12 QPUs are serialized by the GPU-wide VPM mutex; per-QPU VPM areas would allow

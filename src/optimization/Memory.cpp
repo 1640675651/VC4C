@@ -1538,6 +1538,15 @@ NODISCARD static bool combineGeneralTMUReads(Method& method, GeneralTMUGroup& gr
             << " single-word TMU loads into one load with an address per element, starting with: "
             << group.ramReads.front()->to_string() << logging::endl);
 
+    CPPLOG_LAZY_BLOCK(logging::Level::DEBUG, {
+        for(uint8_t i = 0; i < numLoads; ++i)
+            logging::debug() << "  element " << static_cast<unsigned>(i) << ": "
+                             << group.ramReads[i]->getMemoryAddress().to_string() << " -> "
+                             << group.cacheReads[i]->getOutput()->to_string() << logging::endl;
+        for(auto& deferred : group.deferred)
+            logging::debug() << "  deferred: " << (deferred.has() ? deferred->to_string() : "(none)") << logging::endl;
+    });
+
     // 1. the combined load is the last one, so all addresses are already calculated
     auto lastLoad = group.ramReads.back().get();
     auto entry = lastLoad->getTMUCacheEntry();
