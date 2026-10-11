@@ -69,6 +69,62 @@ const std::vector<RegisterFixupStep> qpu_asm::FIXUP_STEPS = {
  * Since combining multiple "scalar" pointer locals into a single SIMD vector and then extraction the corresponding
  * elements again destroys the splat property, we need to check for such usage.
  */
+static bool readsR5(const intermediate::IntermediateInstruction& inst)
+{
+    // also rotations by r5, which have the rotation register (r5) as argument
+    return inst.readsRegister(REG_ACC5) || inst.readsRegister(REG_REPLICATE_ALL) ||
+        inst.readsRegister(REG_REPLICATE_QUAD);
+}
+
+static bool writesR5(const intermediate::IntermediateInstruction& inst)
+{
+    return inst.writesRegister(REG_ACC5) || inst.writesRegister(REG_REPLICATE_ALL) ||
+        inst.writesRegister(REG_REPLICATE_QUAD);
+}
+
+/*
+ * Whether r5 holds a value at the position (before the instruction), which is read at or after the position before r5 is
+ * written again, e.g. a rotation offset written before and read by a rotation after the position, or the replicated
+ * value of an earlier replication (the instruction reordering may move the write of r5 far away from its read).
+ */
+static bool isR5Live(InstructionWalker it)
+{
+    for(; !it.isEndOfBlock(); it.nextInBlock())
+    {
+        if(!it.has())
+            continue;
+        if(readsR5(*it.get()))
+            return true;
+        if(writesR5(*it.get()))
+            return false;
+    }
+    return false;
+}
+
+/*
+ * The position to insert the extraction (and replication via r5) of a grouped value read by the reader: the reader
+ * itself, unless r5 is live there, otherwise before the write of r5 still live there (if the group container is not
+ * written in between). Inserting a replication where r5 is live would overwrite it.
+ */
+static Optional<InstructionWalker> findR5FreePosition(InstructionWalker reader, const Local* container)
+{
+    if(!isR5Live(reader))
+        return reader;
+    auto it = reader.copy();
+    while(!it.isStartOfBlock())
+    {
+        it.previousInBlock();
+        if(!it.has())
+            continue;
+        if(it->writesLocal(container))
+            return {};
+        if(writesR5(*it.get()))
+            return readsR5(*it.get()) || isR5Live(it) ? Optional<InstructionWalker>{} : Optional<InstructionWalker>{it};
+    }
+    // r5 is live across the start of the block
+    return {};
+}
+
 static bool isUsedAsSplatValue(const Local* loc)
 {
     FastSet<const Local*> openSet;
@@ -204,21 +260,27 @@ FixupResult qpu_asm::groupParameters(Method& method, const Configuration& config
 
         for(auto& readerIt : mappingIt->second.second)
         {
+            // The extraction (and replication) goes before the reader, or before the write of r5 still live there
+            auto freePosition = findR5FreePosition(readerIt, groupedValue->local());
+            auto insertIt = freePosition.value_or(readerIt).copy();
             // Doing a full vector rotation forces the now long-living parameter group into accumulator!! So create we a
             // temporary copy right away, since we will need to do so anyway
-            auto tmpGroup = assign(readerIt, groupedValue->type, std::string{(*paramIt)->name}) = *groupedValue;
+            auto tmpGroup = assign(insertIt, groupedValue->type, std::string{(*paramIt)->name}) = *groupedValue;
 
             auto tmp = method.addNewLocal((*paramIt)->type, (*paramIt)->name);
-            readerIt = intermediate::insertVectorExtraction(
-                readerIt, method, tmpGroup, Value(SmallImmediate(groupIndex), TYPE_INT8), tmp);
+            insertIt = intermediate::insertVectorExtraction(
+                insertIt, method, tmpGroup, Value(SmallImmediate(groupIndex), TYPE_INT8), tmp);
             readerIt->replaceLocal(*paramIt, tmp);
             // In SIMT mode, (scalar) parameters are combined with the values of the work-items in all lanes, e.g. the
             // base address with the per-lane offsets
             if(method.metaData.mergedWorkItemsFactor > 1 || isUsedAsSplatValue(tmp.local()))
             {
+                if(!freePosition)
+                    throw CompilationError(CompilationStep::LABEL_REGISTER_MAPPING,
+                        "Replicating a grouped parameter would overwrite the live r5 register", readerIt->to_string());
                 // we need to recreate the splat property by replicating the value
                 auto splatTmp = method.addNewLocal((*paramIt)->type, (*paramIt)->name);
-                readerIt = intermediate::insertReplication(readerIt, tmp, splatTmp);
+                insertIt = intermediate::insertReplication(insertIt, tmp, splatTmp);
                 readerIt->replaceLocal(tmp.local(), splatTmp);
             }
         }
@@ -432,11 +494,14 @@ FixupResult qpu_asm::groupScalarLocals(
                 // if we happen to insert a read just after a write of the same container, insert a NOP to prevent the
                 // container to be forced to an accumulator
                 nop(reader, intermediate::DelayType::WAIT_REGISTER);
+            // The extraction (and replication) goes before the reader, or before the write of r5 still live there
+            auto freePosition = findR5FreePosition(reader, pos.first);
+            auto insertIt = freePosition.value_or(reader).copy();
             // need to extract from temporary container to not force the group container to an accumulator
             auto tmpValue = method.addNewLocal(entry.first->type, entry.first->name);
-            auto tmpContainer = assign(reader, pos.first->type) = pos.first->createReference();
-            reader = intermediate::insertVectorExtraction(
-                reader, method, tmpContainer, Value(SmallImmediate(pos.second), TYPE_INT8), tmpValue);
+            auto tmpContainer = assign(insertIt, pos.first->type) = pos.first->createReference();
+            insertIt = intermediate::insertVectorExtraction(
+                insertIt, method, tmpContainer, Value(SmallImmediate(pos.second), TYPE_INT8), tmpValue);
             if(reader->hasUnpackMode() || reader->readsLiteral() || reader->getVectorRotation())
                 // insert a NOP before the  actually reading instruction to allow for e.g. unpack-modes
                 nop(reader, intermediate::DelayType::WAIT_REGISTER);
@@ -444,11 +509,14 @@ FixupResult qpu_asm::groupScalarLocals(
             // In SIMT mode, uniform values are combined with the values of the work-items in all lanes
             if(method.metaData.mergedWorkItemsFactor > 1 || isUsedAsSplatValue(tmpValue.local()))
             {
+                if(!freePosition)
+                    throw CompilationError(CompilationStep::LABEL_REGISTER_MAPPING,
+                        "Replicating a grouped local would overwrite the live r5 register", reader->to_string());
                 // we need to recreate the splat property by replicating the value
                 auto splatTmp = method.addNewLocal(entry.first->type, entry.first->name);
-                reader = intermediate::insertReplication(reader, tmpValue, splatTmp);
+                insertIt = intermediate::insertReplication(insertIt, tmpValue, splatTmp);
                 // XXX could improve by only inserting this NOP if required (e.g. new local can't be on accumulator)
-                nop(reader, intermediate::DelayType::WAIT_REGISTER);
+                nop(insertIt, intermediate::DelayType::WAIT_REGISTER);
                 reader->replaceLocal(tmpValue.local(), splatTmp);
             }
         }
