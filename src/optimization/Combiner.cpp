@@ -1239,7 +1239,17 @@ std::size_t optimizations::combineVectorRotations(const Module& module, Method& 
                         {
                             auto firstIt =
                                 it.getBasicBlock()->findWalkerForInstruction(firstRot, it.getBasicBlock()->walk(), it);
-                            if(firstIt)
+                            auto combinedOffset =
+                                (rot->getOffset().getRotationOffset().value() +
+                                    firstRot->getOffset().getRotationOffset().value()) %
+                                (!rot->getVectorRotation()->isFullRotationAllowed() ? 4u : 16u);
+                            // If the first rotated value is read elsewhere too, both rotations are kept, so combining
+                            // them only extends the usage range of the first source (e.g. for a chain of rotations
+                            // extracting all vector elements), which may need to be copied to an accumulator for
+                            // every rotation.
+                            if(firstIt &&
+                                (combinedOffset == 0 ||
+                                    firstRot->getOutput()->local()->getUsers(LocalUse::Type::READER).size() == 1))
                             {
                                 ++numChanges;
                                 /*

@@ -1543,6 +1543,272 @@ NODISCARD static InstructionWalker findGeneralTMUGroup(InstructionWalker it, Gen
     return it;
 }
 
+struct SplatCache
+{
+    FastMap<const Local*, bool> results;
+    // the locals in the order they were added to the results
+    std::vector<const Local*> trail;
+};
+
+static bool isSplatValue(const Method& method, const Value& val, SplatCache& cache, unsigned depth);
+
+/*
+ * Whether the flags the given conditional instruction depends on are the same in all elements, i.e. are set in the
+ * same block by an unconditional instruction from splat values (e.g. for the moves of phi-nodes depending on the
+ * loop condition)
+ */
+static bool hasSplatFlags(
+    const Method& method, const intermediate::IntermediateInstruction* inst, SplatCache& cache, unsigned depth)
+{
+    for(const auto& block : method)
+    {
+        auto it = block.findWalkerForInstruction(inst);
+        if(!it)
+            continue;
+        auto walker = it->copy();
+        while(!walker.isStartOfBlock())
+        {
+            walker.previousInBlock();
+            if(walker.isStartOfBlock() || !walker.get() || !walker->doesSetFlag())
+                continue;
+            if(walker->hasConditionalExecution() || walker->getSignal().hasSideEffects())
+                return false;
+            if(auto move = dynamic_cast<const intermediate::MoveOperation*>(walker.get()))
+                return !move->getVectorRotation() && isSplatValue(method, move->getSource(), cache, depth + 1);
+            if(auto op = dynamic_cast<const intermediate::Operation*>(walker.get()))
+                return std::all_of(op->getArguments().begin(), op->getArguments().end(),
+                    [&](const Value& arg) { return isSplatValue(method, arg, cache, depth + 1); });
+            return false;
+        }
+        return false;
+    }
+    return false;
+}
+
+/*
+ * Whether the scalar has the same value in all SIMD elements (e.g. computed from work-group uniform values), so it can be
+ * written into a single element without rotating it there first
+ */
+static bool isSplatValue(const Method& method, const Value& val, SplatCache& cache, unsigned depth = 0)
+{
+    if(val.isAllSame())
+        return true;
+    if(auto reg = val.checkRegister())
+        return *reg == REG_UNIFORM || *reg == REG_QPU_NUMBER || *reg == REG_REPLICATE_ALL;
+    auto loc = val.checkLocal();
+    if(!loc || depth > 24)
+        return false;
+    if(loc->is<Parameter>() || loc->is<BuiltinLocal>() || loc->is<Global>())
+        // read from the UNIFORMs (or a global address), the same in all elements
+        return true;
+    if(!loc->hasUsers(LocalUse::Type::WRITER))
+        // e.g. stack allocations, which might differ per lane in SIMT mode
+        return false;
+    auto cacheIt = cache.results.find(loc);
+    if(cacheIt != cache.results.end())
+        return cacheIt->second;
+    // values written in loops depend on themselves, which are assumed to be splat values while they are checked
+    cache.results[loc] = true;
+    auto trailPosition = cache.trail.size();
+    cache.trail.push_back(loc);
+    bool isSplat = true;
+    loc->forUsers(LocalUse::Type::WRITER, [&](const LocalUser* writer) {
+        if(!isSplat)
+            return;
+        // conditional writes could select different values per element (e.g. in SIMT mode)
+        if(writer->hasConditionalExecution() && !hasSplatFlags(method, writer, cache, depth))
+            isSplat = false;
+        else if(auto move = dynamic_cast<const intermediate::MoveOperation*>(writer))
+            isSplat = !move->getVectorRotation() && isSplatValue(method, move->getSource(), cache, depth + 1);
+        else if(auto op = dynamic_cast<const intermediate::Operation*>(writer))
+            isSplat = std::all_of(op->getArguments().begin(), op->getArguments().end(),
+                [&](const Value& arg) { return isSplatValue(method, arg, cache, depth + 1); });
+        else
+            isSplat = false;
+    });
+    if(!isSplat)
+    {
+        // the results depending on the assumption of this value being a splat value are invalid
+        for(auto i = trailPosition; i < cache.trail.size(); ++i)
+            cache.results.erase(cache.trail[i]);
+        cache.trail.resize(trailPosition);
+        cache.results[loc] = false;
+    }
+    return isSplat;
+}
+
+/*
+ * In SIMT mode, the work-group uniform values loaded are replicated to all lanes. Extracting all elements of the
+ * combined load first would keep the combined vector alive for all the extractions, so every vector-rotation would
+ * need its own copy of it on an accumulator. Instead, every replication of element i reads the vector replicated
+ * before rotated by the difference of the element indices, so all rotated vectors are short-living.
+ */
+static bool insertChainedReplications(
+    Method& method, InstructionWalker it, const Value& combined, const FastAccessList<Value>& outputs)
+{
+    FastMap<const LocalUser*, uint8_t> replications;
+    for(uint8_t i = 0; i < outputs.size(); ++i)
+    {
+        auto loc = outputs[i].checkLocal();
+        if(!loc)
+            return false;
+        auto readers = loc->getUsers(LocalUse::Type::READER);
+        if(readers.size() != 1)
+            return false;
+        auto move = dynamic_cast<const intermediate::MoveOperation*>(*readers.begin());
+        if(!move || move->getVectorRotation() || move->hasConditionalExecution() || move->hasPackMode() ||
+            move->hasUnpackMode() || move->hasSideEffects() || !move->getOutput()->hasRegister(REG_REPLICATE_ALL))
+            return false;
+        replications.emplace(move, i);
+    }
+    // all replications need to follow the combined load in this block
+    std::vector<std::pair<InstructionWalker, uint8_t>> orderedReplications;
+    for(auto walker = it.copy(); !walker.isEndOfBlock() && orderedReplications.size() < replications.size();
+        walker.nextInBlock())
+    {
+        auto repIt = walker.has() ? replications.find(walker.get()) : replications.end();
+        if(repIt != replications.end())
+            orderedReplications.emplace_back(walker, repIt->second);
+    }
+    if(orderedReplications.size() != replications.size())
+        return false;
+
+    Value previous = combined;
+    uint8_t previousIndex = 0;
+    for(auto& entry : orderedReplications)
+    {
+        auto move = entry.first.get<intermediate::MoveOperation>();
+        if(entry.second != previousIndex)
+        {
+            auto rotated = method.addNewLocal(combined.type, "%combined_tmu_rotated");
+            auto offset = static_cast<int32_t>((entry.second + 16u - previousIndex) % 16u);
+            entry.first = intermediate::insertVectorRotation(
+                entry.first, previous, Value(Literal(offset), TYPE_INT8), rotated, intermediate::Direction::DOWN);
+            previous = rotated;
+            previousIndex = entry.second;
+        }
+        move->setSource(Value(previous));
+    }
+    return true;
+}
+
+/*
+ * If all addresses are splat values of the form base + literal offset, the address vector can be assembled with a
+ * per-element load of the offsets (in steps of a common stride) and a conditional move for every distinct base value,
+ * e.g. for the rows and columns of a matrix tile:
+ *   addresses = base0
+ *   - = ldi.setf <elements of base1>
+ *   addresses = base1 (ifzc)
+ *   ...
+ *   offsets = ldi <offset indices per element>
+ *   offsets = offsets << log2(stride)
+ *   addresses = addresses + offsets
+ */
+static bool insertAffineAddressAssembly(Method& method, InstructionWalker& it, const Value& addresses,
+    const std::vector<Value>& elementAddresses, SplatCache& splatValues)
+{
+    std::vector<std::pair<Value, int32_t>> elements;
+    elements.reserve(NATIVE_VECTOR_SIZE);
+    for(const auto& address : elementAddresses)
+    {
+        Value base = address;
+        int32_t offset = 0;
+        auto writer = dynamic_cast<const intermediate::Operation*>(address.getSingleWriter());
+        if(writer && writer->op == OP_ADD && !writer->hasConditionalExecution() && !writer->hasSideEffects() &&
+            !writer->hasPackMode() && !writer->hasUnpackMode() && writer->getSecondArg())
+        {
+            const auto& first = writer->getFirstArg();
+            const auto& second = writer->assertArgument(1);
+            if(second.getLiteralValue() && first.checkLocal())
+            {
+                base = first;
+                offset = second.getLiteralValue()->signedInt();
+            }
+            else if(first.getLiteralValue() && second.checkLocal())
+            {
+                base = second;
+                offset = first.getLiteralValue()->signedInt();
+            }
+        }
+        // the base value must not change between the calculation of the address and the combined load
+        auto baseLocal = base.checkLocal();
+        if(!baseLocal || (!baseLocal->is<Parameter>() && !base.getSingleWriter()) ||
+            !isSplatValue(method, base, splatValues))
+            return false;
+        elements.emplace_back(base, offset);
+    }
+    // the elements beyond the group load the first address, which is loaded anyway
+    while(elements.size() < NATIVE_VECTOR_SIZE)
+        elements.push_back(elements.front());
+
+    int32_t minOffset = elements.front().second;
+    for(const auto& element : elements)
+        minOffset = std::min(minOffset, element.second);
+    int32_t stride = 0;
+    for(const auto& element : elements)
+    {
+        auto diff = element.second - minOffset;
+        if(diff > 0 && (stride == 0 || diff < stride))
+            stride = diff;
+    }
+    // the offset indices are loaded as 2-bit values per element, a power of two stride is applied by a shift
+    if(stride != 0 && (stride & (stride - 1)) != 0)
+        return false;
+    SIMDVector offsetIndices{};
+    for(std::size_t i = 0; i < elements.size(); ++i)
+    {
+        auto diff = elements[i].second - minOffset;
+        if(stride != 0 && (diff % stride != 0 || diff / stride > 3))
+            return false;
+        offsetIndices[i] = Literal(static_cast<uint32_t>(stride != 0 ? diff / stride : 0));
+    }
+
+    std::vector<Value> bases;
+    for(const auto& element : elements)
+    {
+        if(std::find(bases.begin(), bases.end(), element.first) == bases.end())
+            bases.push_back(element.first);
+    }
+    // compare with the conditional move of every single element (2 instructions per element)
+    auto numInstructions = 1 + 2 * (bases.size() - 1) + (stride != 0 ? (stride > 1 ? 3 : 2) : 0) + (minOffset != 0);
+    if(numInstructions >= 2 * elementAddresses.size() - 1)
+        return false;
+
+    CPPLOG_LAZY(logging::Level::DEBUG,
+        log << "Assembling TMU addresses from " << bases.size() << " base values with offsets " << minOffset
+            << " + stride " << stride << " * " << offsetIndices.to_string() << logging::endl);
+    assign(it, addresses) = bases.front();
+    for(std::size_t b = 1; b < bases.size(); ++b)
+    {
+        SIMDVector mask{};
+        for(std::size_t i = 0; i < elements.size(); ++i)
+            mask[i] = Literal(elements[i].first == bases[b] ? 1u : 0u);
+        assign(it, NOP_REGISTER) =
+            (load(intermediate::LoadImmediate::fromLoadedValues(mask, intermediate::LoadType::PER_ELEMENT_UNSIGNED),
+                 intermediate::LoadType::PER_ELEMENT_UNSIGNED),
+                SetFlag::SET_FLAGS);
+        assign(it, addresses) =
+            (bases[b], COND_ZERO_CLEAR, intermediate::InstructionDecorations::ELEMENT_INSERTION);
+    }
+    if(stride != 0)
+    {
+        auto offsets = assign(it, TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE), "%tmu_address_offsets") = load(
+            intermediate::LoadImmediate::fromLoadedValues(offsetIndices, intermediate::LoadType::PER_ELEMENT_UNSIGNED),
+            intermediate::LoadType::PER_ELEMENT_UNSIGNED);
+        if(stride > 1)
+        {
+            uint32_t shift = 0;
+            while((1 << shift) < stride)
+                ++shift;
+            offsets = assign(it, offsets.type, "%tmu_address_offsets") = (offsets << Value(Literal(shift), TYPE_INT8));
+        }
+        assign(it, addresses) = (addresses + offsets);
+    }
+    if(minOffset != 0)
+        assign(it, addresses) = (addresses + Value(Literal(minOffset), TYPE_INT32));
+    return true;
+}
+
 NODISCARD static bool combineGeneralTMUReads(Method& method, GeneralTMUGroup& group)
 {
     auto numLoads = static_cast<uint8_t>(group.ramReads.size());
@@ -1567,11 +1833,26 @@ NODISCARD static bool combineGeneralTMUReads(Method& method, GeneralTMUGroup& gr
     auto entry = lastLoad->getTMUCacheEntry();
     const Value& addresses = entry->addresses;
     InstructionWalker it = group.ramReads.back();
-    // the elements beyond the group load the first address, which is loaded anyway
-    it = intermediate::insertReplication(it, group.ramReads.front()->getMemoryAddress(), addresses);
-    for(uint8_t i = 1; i < numLoads; ++i)
-        it = intermediate::insertVectorInsertion(
-            it, method, addresses, Value(Literal(i), TYPE_INT8), group.ramReads[i]->getMemoryAddress());
+    SplatCache splatValues;
+    std::vector<Value> elementAddresses;
+    for(auto& read : group.ramReads)
+        elementAddresses.push_back(read->getMemoryAddress());
+    bool isAssembled = insertAffineAddressAssembly(method, it, addresses, elementAddresses, splatValues);
+    if(!isAssembled)
+        // the elements beyond the group load the first address, which is loaded anyway
+        it = intermediate::insertReplication(it, group.ramReads.front()->getMemoryAddress(), addresses);
+    for(uint8_t i = 1; i < numLoads && !isAssembled; ++i)
+    {
+        const auto& address = group.ramReads[i]->getMemoryAddress();
+        if(isSplatValue(method, address, splatValues))
+        {
+            // the address is already in element i
+            auto cond = assignNop(it) = selectSIMDElement(i);
+            assign(it, addresses) = (address, cond, intermediate::InstructionDecorations::ELEMENT_INSERTION);
+        }
+        else
+            it = intermediate::insertVectorInsertion(it, method, addresses, Value(Literal(i), TYPE_INT8), address);
+    }
     entry->numVectorElements = Value(Literal(numLoads), TYPE_INT8);
     entry->customAddressCalculation = true;
     lastLoad->setMemoryAddress(addresses);
@@ -1584,8 +1865,6 @@ NODISCARD static bool combineGeneralTMUReads(Method& method, GeneralTMUGroup& gr
         outputs.emplace_back(*read->getOutput());
     lastRead->setOutput(combined);
     it = group.cacheReads.back().base().copy().nextInBlock();
-    for(uint8_t i = 0; i < numLoads; ++i)
-        it = intermediate::insertVectorExtraction(it, method, combined, Value(Literal(i), TYPE_INT8), outputs[i]);
 
     // 3. move the deferred instructions located before the combined load after it (in their order)
     for(auto& deferred : group.deferred)
@@ -1605,6 +1884,14 @@ NODISCARD static bool combineGeneralTMUReads(Method& method, GeneralTMUGroup& gr
             continue;
         it.emplace(deferred.release());
         it.nextInBlock();
+    }
+
+    // the extractions are inserted directly after the combined load, before the deferred instructions reading them
+    it = group.cacheReads.back().base().copy().nextInBlock();
+    if(!insertChainedReplications(method, it, combined, outputs))
+    {
+        for(uint8_t i = 0; i < numLoads; ++i)
+            it = intermediate::insertVectorExtraction(it, method, combined, Value(Literal(i), TYPE_INT8), outputs[i]);
     }
 
     // 4. remove the other loads

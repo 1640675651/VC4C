@@ -949,6 +949,27 @@ work-items per QPU in classic mode, or a single chunk per QPU in SIMT mode.
   helper kernels, as fast. A bug of the register fix-ups (see "Known bugs") made some combined loads
   wrong (lane 0 of the address vector), fixed. Verified with reduced kernels
   (`cts-results/tools/comb/`).
+- **Cheaper combined loads (2026-10-11).** The `GEMMK = 1` inner loop spent most of its instructions
+  on assembling the 16 addresses and extracting the 16 values. Three changes:
+  - addresses which are the same in all lanes (computed from literals, UNIFORMs and such values,
+    also through phi-nodes conditional on such flags) are written into their lane by a conditional
+    move, without rotating them there first;
+  - addresses of the form `base + literal offset` with up to 4 offsets in steps of a power of two
+    (rows and columns of a tile) are assembled from a per-element load of the offsets (hoisted out
+    of the loop) and one flag-setting per-element load and conditional move per distinct base: 4
+    rows of 4 elements take 7 instructions instead of 45;
+  - in SIMT mode, the values are replicated to all lanes anyway, so the replication of every value
+    reads the vector replicated before rotated by the difference of the elements (a chain of short-
+    living rotated values), instead of extracting all values from the combined vector, which needed
+    a copy of the long-living vector on an accumulator for every rotation. For this, two vector
+    rotations are only merged into one if the first rotated value is not read elsewhere (otherwise
+    both stay, and merging only extends the life of the source).
+
+  Together with CLBlast reading B through a pointer advanced per tile (no 32-bit multiplication per
+  load), the loop went from 266 to 142 instructions (32 arithmetic): 512³ `Xgemm` 242 → 176 ms (1.53
+  GFLOPS, kernel only). What remains per value of A: rotate, replicate, move (the move and the next
+  rotation could share an instruction, but the instruction combiner pairs neither vector rotations nor
+  reads of r5).
 - **Hardware performance counters (2026-10-11).** The vc4 driver's performance monitors
   (`DRM_IOCTL_VC4_PERFMON_*`) now also count compute jobs (`perfmonid` of `drm_vc4_submit_qpu`), and
   VC4CL prints 16 counters per kernel with `VC4CL_PERF_COUNTERS=1` (2: also per job). The QPU cycles
