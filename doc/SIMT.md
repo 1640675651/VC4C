@@ -420,16 +420,21 @@ as the row-major one of the same memory with A and B swapped (C^T = B^T A^T, `Xg
 computing a 16 × 16 tile of C, the lanes loading consecutive elements of B, and every work-item 4
 consecutive elements (`KREG`) of each of its 4 rows of A, which are the same for all lanes. Those
 loads are combined into one TMU load per row by `--fcombine-tmu-loads` (see roadmap item 8), which
-CLBlast now passes for Broadcom devices: 384 → 244 ms for 512³. The whole SGEMM call (all kernels,
-SIMT mode, `clblast_client_xgemm -precision 32`):
+CLBlast now passes for Broadcom devices: 384 → 244 ms for 512³. Since then, the combined loads got
+cheaper (roadmap item 8) and CLBlast reads B through a pointer advanced per k-tile (CLBlast `892b081`),
+so the loop went from 266 to 142 instructions. The whole SGEMM call (all kernels, SIMT mode,
+`clblast_client_xgemm -precision 32`):
 
-| n | row-major, before | row-major, kernel 1 | column-major, before | column-major, kernel 1 |
-|---|---|---|---|---|
-| 256 | 240 ms | 32 ms (1.03 GFLOPS) | 74 ms | 33 ms (1.03 GFLOPS) |
-| 512 | 1148 ms | 246 ms (1.09 GFLOPS) | 423 ms | 246 ms (1.09 GFLOPS) |
+| n | row-major, before | row-major, kernel 1 | row-major, now | column-major, before | column-major, kernel 1 | column-major, now |
+|---|---|---|---|---|---|---|
+| 128 | 60 ms | 5.2 ms | 3.8 ms | 21 ms | 5.0 ms | 4.0 ms |
+| 256 | 240 ms | 32 ms (1.03 GFLOPS) | 23 ms (1.43 GFLOPS) | 74 ms | 33 ms (1.03 GFLOPS) | 23 ms (1.49 GFLOPS) |
+| 512 | 1148 ms | 246 ms (1.09 GFLOPS) | 180 ms (1.49 GFLOPS) | 423 ms | 246 ms (1.09 GFLOPS) | 177 ms (1.52 GFLOPS) |
 
-CLBlast's SGEMM test passes all 234 cases. (Its test binaries ignore `-precision` and continue with
-CGEMM, which still fails on this device.)
+("before": kernel 0 with the helper kernels; "kernel 1": VC4C `caec839`; "now": VC4C `3ed9669`.)
+CLBlast's SGEMM test passes all 234 cases (also with VC4C `3ed9669` and CLBlast `892b081`). (Its test binaries ignore `-precision` and continue with
+CGEMM, which still fails on this device. Stop them when DGEMM starts; after CGEMM, their second SGEMM
+round fails about half of its cases.)
 
 ## Caveats
 
