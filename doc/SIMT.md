@@ -597,6 +597,16 @@ and on the compiler being correct in both modes (see step 1).
   `--f…` optimization options from the build options to VC4C). The host-checked harness and the logs
   (`vs_check.c`, `exp.sh`, `experiments.log`) are in `cts-results/tools/` next to this repository.
 
+- Fixed (2026-10-11): **grouped TMU loads with a non-constant stride used values before they were
+  calculated.** `GroupTMUAccess` (enabled by default) groups loads with a common stride and calculates
+  the stride from the second load's address, so it moves the instructions calculating that address
+  before the first load. They were collected depth-first and moved in reverse order, so an
+  instruction whose result is used twice (e.g. in an intrinsified 32-bit multiplication) was found
+  twice and moved behind one of its readers. Two work-group uniform loads `in[(g * 7 + i) * stride +
+  base + i]` (`cts-results/tools/comb/comb.cl`, `N = 2`) loaded from wrong addresses in both modes
+  (192 of 192 wrong, the emulator stopped at an address outside memory). Now they are moved once each,
+  in their original order.
+
 - Fixed: **irregular integer types were widened without masking.** LLVM narrows values to types like
   `i2` (e.g. for `switch (v & 3)`), which the front-end extends to `i8`. The truncation masked with
   `0xFF` instead of `0x3`, and negative constants were sign-extended, so `switch (v & 3)` took the

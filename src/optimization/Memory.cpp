@@ -922,6 +922,31 @@ NODISCARD static bool checkSecondAddressCalculation(InstructionWalker start, Ins
     return true;
 }
 
+/*
+ * Moves the instructions calculating the address of the second load (as found by checkSecondAddressCalculation) before
+ * the given position. They are moved in their original order, since an instruction is found multiple times if its
+ * result is used by multiple of the calculating instructions (e.g. for intrinsified multiplications).
+ */
+static void moveSecondAddressCalculations(
+    InstructionWalker insertIt, TMUAccessGroup& group, FastAccessList<InstructionWalker>& calculatingInstructions)
+{
+    FastSet<const intermediate::IntermediateInstruction*> remaining;
+    for(auto& calc : calculatingInstructions)
+        remaining.emplace(calc.get());
+    auto calc = group.ramReads.front().base().copy();
+    while(!remaining.empty() && !calc.isEndOfBlock() && calc != group.ramReads.at(1).base())
+    {
+        if(!calc.has() || remaining.erase(calc.get()) == 0)
+        {
+            calc.nextInBlock();
+            continue;
+        }
+        auto decorations = insertIt.emplace(calc.release()).decoration;
+        insertIt.nextInBlock();
+        calc.safeErase(decorations);
+    }
+}
+
 static std::pair<std::vector<SubExpression>, std::vector<std::vector<SubExpression>>> getElementOffsetsAndStrides(
     TMUAccessGroup& group, const std::vector<SubExpression>& baseUniformParts)
 {
@@ -1202,14 +1227,9 @@ NODISCARD static bool groupTMUReads(Method& method, TMUAccessGroup& group)
             log << "Using common non-constant TMU access group stride of: " << elementStride.to_string()
                 << logging::endl);
 
-        // move all necessary address-calculating instructions before the new group load (in inverse order)
+        // move all necessary address-calculating instructions before the new group load (and the stride calculation)
         // we also do it if we could convert the stride expression above, in case they are still required for that
-        auto insertIt = it.copy().previousInBlock();
-        for(auto& calc : secondAddressCalculations)
-        {
-            auto decorations = insertIt.emplace(calc.release()).decoration;
-            calc.safeErase(decorations);
-        }
+        moveSecondAddressCalculations(it.copy().previousInBlock(), group, secondAddressCalculations);
 
         auto customAddressOffsets =
             method.addNewLocal(TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE), "%tmu_group_offsets");
@@ -1257,14 +1277,9 @@ NODISCARD static bool groupTMUReads(Method& method, TMUAccessGroup& group)
                 << strides->primaryStride->to_string() << " and " << strides->secondaryStride.to_string()
                 << logging::endl);
 
-        // move all necessary address-calculating instructions before the new group load (in inverse order)
+        // move all necessary address-calculating instructions before the new group load (and the stride calculation)
         // we also do it if we could convert the stride expression above, in case they are still required for that
-        auto insertIt = it.copy().previousInBlock();
-        for(auto& calc : secondAddressCalculations)
-        {
-            auto decorations = insertIt.emplace(calc.release()).decoration;
-            calc.safeErase(decorations);
-        }
+        moveSecondAddressCalculations(it.copy().previousInBlock(), group, secondAddressCalculations);
 
         auto replicatedStride =
             method.addNewLocal(TYPE_INT32.toVectorType(group.usedVectorSize), "%tmu_group_primary_stride");
